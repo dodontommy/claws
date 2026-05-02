@@ -1,10 +1,39 @@
+# Rust build output
 /target
 **/target
 **/*.rs.bk
-.DS_Store
+
+# Local secrets / env
+.env
+.env.*
+*.pem
+*.key
+
+# Local state / runtime artifacts
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.db
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+*.code-workspace
 *.swp
 *.swo
+*~
 
-# OneDrive cruft
+# Backup files
+*.bak
+*.orig
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# OneDrive lock files
 ~$*
 *.tmp
