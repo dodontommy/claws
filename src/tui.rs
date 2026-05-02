@@ -865,71 +865,87 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
 
 fn draw_help(f: &mut ratatui::Frame) {
     let parent = f.area();
-    let w = 64.min(parent.width.saturating_sub(4));
-    let h = 30.min(parent.height.saturating_sub(2));
+    let w = 78.min(parent.width.saturating_sub(4));
+    let h = 38.min(parent.height.saturating_sub(2));
     let area = centered_rect(w, h, parent);
     f.render_widget(Clear, area);
+    let title = format!(" claws {}  ·  keymap ", env!("CARGO_PKG_VERSION"));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
         .title(ratatui::text::Span::styled(
-            " keymap ",
+            title,
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     use ratatui::text::{Line, Span};
-    let dim = Style::default().fg(Color::DarkGray);
-    let key = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let txt = Style::default().fg(Color::White);
+    let key_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::White);
+    let dim_style = Style::default().fg(Color::DarkGray);
 
-    let mut lines: Vec<Line> = Vec::new();
-    let mut sec = |label: &str| -> Line<'static> {
+    let sec = |label: &'static str| -> Line<'static> {
         Line::from(Span::styled(
-            format!("  {label}"),
+            label.to_string(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
     };
     let row = |k: &str, v: &str| -> Line<'static> {
         Line::from(vec![
-            Span::styled("    ", dim),
-            Span::styled(format!("{:<14}", k), key),
-            Span::styled(v.to_string(), txt),
+            Span::styled("  ", dim_style),
+            Span::styled(format!("{k:<22}"), key_style),
+            Span::styled(v.to_string(), desc_style),
         ])
     };
 
+    let mut lines: Vec<Line> = Vec::new();
+
     lines.push(sec("dashboard"));
-    lines.push(row("hjkl / arrows", "navigate (j/k = down/up by row)"));
-    lines.push(row("enter", "attach to selected"));
-    lines.push(row("c", "new session (modal)"));
+    lines.push(row("h j k l / arrows", "navigate sessions"));
+    lines.push(row("enter", "attach to selected session"));
+    lines.push(row("c", "new session (opens spawn form)"));
     lines.push(row("r", "rename selected"));
-    lines.push(row("R", "restart (kill + resume)"));
-    lines.push(row("x", "close (forget) selected"));
+    lines.push(row("R", "restart selected (kill + claude --resume)"));
+    lines.push(row("x", "close & forget selected"));
     lines.push(row("/", "filter sessions"));
-    lines.push(row("i", "details popup"));
-    lines.push(row("F5", "force refresh list"));
+    lines.push(row("i", "session details popup"));
+    lines.push(row("F5", "force refresh"));
     lines.push(row("?", "this help"));
-    lines.push(row("q", "quit (daemon stays alive)"));
+    lines.push(row("q", "quit TUI  (daemon and sessions stay alive)"));
+
     lines.push(Line::from(""));
-    lines.push(sec("attached"));
-    lines.push(row("Ctrl-Space", "enter prefix mode"));
-    lines.push(row("prefix d", "detach"));
-    lines.push(row("prefix n / p", "next / previous session"));
-    lines.push(row("prefix 1..9", "jump to session N"));
-    lines.push(row("prefix q", "quit"));
+    lines.push(sec("attached view"));
+    lines.push(row("Ctrl-Space", "prefix — next key is a claws command"));
+    lines.push(row("Ctrl-Space d", "detach back to dashboard"));
+    lines.push(row("Ctrl-Space n / p", "next / previous session"));
+    lines.push(row("Ctrl-Space 1-9", "jump to session N"));
+    lines.push(row("Ctrl-Space q", "quit TUI"));
+    lines.push(row("Ctrl-Space Ctrl-Space", "send literal Ctrl-Space to claude"));
+
     lines.push(Line::from(""));
-    lines.push(sec("spawn form"));
-    lines.push(row("tab", "switch between cwd / flags"));
-    lines.push(row("↑/↓ in cwd", "cycle recent dirs"));
+    lines.push(sec("spawn form  (c)"));
+    lines.push(row("tab", "switch between cwd and flags fields"));
+    lines.push(row("↑ / ↓  (cwd field)", "cycle recent directories"));
     lines.push(row("Ctrl-Y", "toggle --dangerously-skip-permissions"));
     lines.push(row("enter", "create"));
     lines.push(row("esc", "cancel"));
+
+    lines.push(Line::from(""));
+    lines.push(sec("from the shell  (outside the TUI)"));
+    lines.push(row("claws", "open the dashboard"));
+    lines.push(row("claws update", "install the latest release in place"));
+    lines.push(row("claws kill-server", "stop the daemon and all sessions"));
+    lines.push(row("claws logs", "print the log file path"));
+    lines.push(row("claws --version", "print version"));
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  press any key to close",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     )));
 
     f.render_widget(
