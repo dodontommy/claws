@@ -39,3 +39,30 @@ pub fn socket_name() -> Result<String> {
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
     Ok(format!(r"\\.\pipe\claws-{user}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_name_has_expected_shape() {
+        let s = socket_name().expect("socket name");
+        #[cfg(unix)]
+        {
+            assert!(s.starts_with("/tmp/claws-"), "unexpected unix socket: {s}");
+            assert!(s.ends_with("/sock"), "unexpected unix socket: {s}");
+        }
+        #[cfg(windows)]
+        {
+            assert!(s.starts_with(r"\\.\pipe\claws-"), "unexpected windows pipe: {s}");
+        }
+    }
+
+    #[test]
+    fn log_file_under_state_dir() {
+        let s = state_dir().expect("state dir");
+        let l = log_file().expect("log file");
+        assert!(l.starts_with(&s));
+        assert_eq!(l.file_name().and_then(|s| s.to_str()), Some("claws.log"));
+    }
+}

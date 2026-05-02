@@ -225,10 +225,16 @@ async fn rpc_round_trip(
 ) -> Result<Response> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
+    // Token may legitimately be missing on a brand-new install where the
+    // daemon hasn't started yet; in that case we send empty and the daemon
+    // rejects with -32001 unauthorized, which surfaces a useful error.
+    let auth = crate::auth::read_token().unwrap_or_default();
     let req = Request {
         id: 1,
         method: method.to_string(),
         params,
+        auth,
+        claws_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');

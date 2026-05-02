@@ -34,6 +34,11 @@ pub struct Theme {
     // Mode-specific colors
     pub footer_scroll: Color,
     pub footer_prefix: Color,
+
+    // Subtle row-wide bg used to flag "needs you" sessions in the sidebar.
+    // Dark variant of the awaiting palette; should be muted enough not to
+    // overwhelm the foreground text.
+    pub awaiting_bg: Color,
 }
 
 pub const DEFAULT: Theme = Theme {
@@ -59,6 +64,7 @@ pub const DEFAULT: Theme = Theme {
     context_high: Color::Red,
     footer_scroll: Color::Magenta,
     footer_prefix: Color::Yellow,
+    awaiting_bg: Color::Indexed(53),
 };
 
 pub const CATPPUCCIN: Theme = Theme {
@@ -84,6 +90,7 @@ pub const CATPPUCCIN: Theme = Theme {
     context_high: Color::Rgb(243, 139, 168),
     footer_scroll: Color::Rgb(203, 166, 247),
     footer_prefix: Color::Rgb(249, 226, 175),
+    awaiting_bg: Color::Rgb(49, 30, 60),
 };
 
 pub const TOKYO_NIGHT: Theme = Theme {
@@ -109,6 +116,7 @@ pub const TOKYO_NIGHT: Theme = Theme {
     context_high: Color::Rgb(247, 118, 142),
     footer_scroll: Color::Rgb(187, 154, 247),
     footer_prefix: Color::Rgb(224, 175, 104),
+    awaiting_bg: Color::Rgb(45, 30, 65),
 };
 
 pub const NORD: Theme = Theme {
@@ -134,6 +142,7 @@ pub const NORD: Theme = Theme {
     context_high: Color::Rgb(191, 97, 106),
     footer_scroll: Color::Rgb(180, 142, 173),
     footer_prefix: Color::Rgb(235, 203, 139),
+    awaiting_bg: Color::Rgb(50, 38, 60),
 };
 
 pub const MONO: Theme = Theme {
@@ -159,6 +168,7 @@ pub const MONO: Theme = Theme {
     context_high: Color::Rgb(255, 255, 255),
     footer_scroll: Color::Rgb(220, 220, 220),
     footer_prefix: Color::Rgb(220, 220, 220),
+    awaiting_bg: Color::Rgb(40, 40, 40),
 };
 
 pub static ALL: &[Theme] = &[DEFAULT, CATPPUCCIN, TOKYO_NIGHT, NORD, MONO];
@@ -171,15 +181,6 @@ pub fn current() -> Theme {
 
 pub fn set(t: Theme) {
     *ACTIVE.write().unwrap() = t;
-}
-
-pub fn cycle() -> Theme {
-    let cur = current();
-    let idx = ALL.iter().position(|t| t.name == cur.name).unwrap_or(0);
-    let next = ALL[(idx + 1) % ALL.len()].clone();
-    set(next.clone());
-    save(&next);
-    next
 }
 
 fn persist_path() -> Option<PathBuf> {

@@ -23,6 +23,11 @@ pub async fn run() -> Result<()> {
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
 
+    // Generate a fresh per-startup auth token before binding the socket so
+    // the file exists by the time the first client connects.
+    let auth_token = Arc::new(crate::auth::write_new_token().context("write auth token")?);
+    tracing::info!("auth token written");
+
     let name = sock
         .clone()
         .to_fs_name::<GenericFilePath>()
@@ -53,8 +58,9 @@ pub async fn run() -> Result<()> {
                         let sd = shutdown.clone();
                         let reg = registry.clone();
                         let st = store.clone();
+                        let tok = auth_token.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, reg, st, sd).await {
+                            if let Err(e) = handle_client(stream, tok, reg, st, sd).await {
                                 tracing::warn!(error = %e, "client connection closed");
                             }
                         });
@@ -87,8 +93,20 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
     }
     tracing::info!(count = to_resume.len(), "resuming sessions");
     for ps in to_resume {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         if !ps.cwd.is_dir() {
             tracing::warn!(id = %ps.id, cwd = %ps.cwd.display(), "skipping resume: cwd missing");
+            reg.record_resume_failure(crate::registry::FailedResume {
+                id: ps.id,
+                cwd: ps.cwd.clone(),
+                name: ps.name.clone(),
+                display_override: ps.display_override.clone(),
+                failed_at_ms: now_ms,
+                reason: format!("cwd missing: {}", ps.cwd.display()),
+            });
             continue;
         }
         let settings_path = match hook::write_settings_for(ps.id) {
@@ -117,9 +135,25 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
             }
             Ok(Err(e)) => {
                 tracing::warn!(id = %ps.id, error = ?e, "resume failed");
+                reg.record_resume_failure(crate::registry::FailedResume {
+                    id: ps.id,
+                    cwd: ps.cwd.clone(),
+                    name: ps.name.clone(),
+                    display_override: ps.display_override.clone(),
+                    failed_at_ms: now_ms,
+                    reason: format!("{e:#}"),
+                });
             }
             Err(e) => {
                 tracing::warn!(id = %ps.id, error = %e, "resume join error");
+                reg.record_resume_failure(crate::registry::FailedResume {
+                    id: ps.id,
+                    cwd: ps.cwd.clone(),
+                    name: ps.name.clone(),
+                    display_override: ps.display_override.clone(),
+                    failed_at_ms: now_ms,
+                    reason: format!("join error: {e}"),
+                });
             }
         }
     }
@@ -127,6 +161,7 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
 
 async fn handle_client(
     stream: interprocess::local_socket::tokio::Stream,
+    auth_token: Arc<String>,
     registry: SessionRegistry,
     store: Store,
     shutdown: Arc<Notify>,
@@ -152,7 +187,7 @@ async fn handle_client(
                 continue;
             }
         };
-        let resp = dispatch(&req, &registry, &store, &shutdown).await;
+        let resp = dispatch(&req, &auth_token, &registry, &store, &shutdown).await;
         let mut out = serde_json::to_string(&resp)?;
         out.push('\n');
         writer.write_all(out.as_bytes()).await?;
@@ -162,10 +197,27 @@ async fn handle_client(
 
 async fn dispatch(
     req: &Request,
+    auth_token: &str,
     registry: &SessionRegistry,
     store: &Store,
     shutdown: &Notify,
 ) -> Response {
+    // Constant-time-ish equality on the auth token. UUID tokens are short
+    // and the secret comparison isn't truly time-constant in pure Rust,
+    // but the attacker can't observe timing on a local IPC socket from
+    // a different user account anyway.
+    if req.auth.is_empty() || req.auth != auth_token {
+        tracing::warn!(method = %req.method, "rejected request: bad or missing auth");
+        return err(req.id, RpcError::unauthorized());
+    }
+    let server_v = env!("CARGO_PKG_VERSION");
+    if !req.claws_version.is_empty() && req.claws_version != server_v {
+        tracing::warn!(
+            client = %req.claws_version,
+            daemon = %server_v,
+            "client/daemon version mismatch"
+        );
+    }
     match req.method.as_str() {
         "ping" => ok(req.id, json!("pong")),
         "shutdown" => {
@@ -278,6 +330,32 @@ async fn handle_create(
 
 async fn handle_list(id: u64, reg: &SessionRegistry) -> Response {
     let mut infos: Vec<SessionInfo> = reg.all().iter().map(|s| session_info(s)).collect();
+    // Tack on synthetic entries for resume failures so the user sees them
+    // in the dashboard instead of silently losing the session.
+    for fr in reg.failed_resumes() {
+        infos.push(SessionInfo {
+            id: fr.id,
+            name: fr.name,
+            cwd: fr.cwd.to_string_lossy().into_owned(),
+            status: "resume_failed".to_string(),
+            exit_code: None,
+            started_at_ms: fr.failed_at_ms,
+            last_activity_ms: fr.failed_at_ms,
+            model: None,
+            current_tool: None,
+            last_message: Some(format!("resume failed: {}", fr.reason)),
+            ai_title: None,
+            turn_count: 0,
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_cache_read: 0,
+            display_override: fr.display_override,
+            context_pct: None,
+            context_used: None,
+            context_total: None,
+            extra_args: Vec::new(),
+        });
+    }
     infos.sort_by_key(|i| i.started_at_ms);
     ok(id, serde_json::to_value(infos).unwrap())
 }
@@ -326,13 +404,16 @@ async fn handle_close(
     if let Err(e) = store.mark_closed_by_user(p.session_id) {
         tracing::warn!(error = %e, "could not mark session closed_by_user");
     }
-    match reg.remove(p.session_id) {
-        Some(s) => {
-            s.close();
-            ok(id, json!({"closed": true}))
-        }
-        None => err(id, RpcError::session_not_found(p.session_id)),
+    if let Some(s) = reg.remove(p.session_id) {
+        s.close();
+        return ok(id, json!({"closed": true}));
     }
+    // No live session; might be a synthetic resume_failed row. Drop it and
+    // call this success — the user just wants the entry to go away.
+    if reg.forget_failed_resume(p.session_id) {
+        return ok(id, json!({"closed": true}));
+    }
+    err(id, RpcError::session_not_found(p.session_id))
 }
 
 async fn handle_rename(
@@ -476,6 +557,7 @@ fn session_info(s: &Session) -> SessionInfo {
         context_pct,
         context_used,
         context_total,
+        extra_args: s.extra_args.clone(),
     }
 }
 

@@ -1,0 +1,141 @@
+# Changelog
+
+All notable changes to claws are listed here. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
+[SemVer](https://semver.org/).
+
+## [0.2.0] — 2026-05-02
+
+### Worktrees
+- **Spawn form is now worktree-aware.** When the typed cwd is inside a
+  git repo, claws lists every worktree of that repo (parsed from
+  `git worktree list --porcelain`). Tab into the section, pick one to
+  populate cwd, or hit `[+ new worktree]` to open a sub-form for branch
+  name + path. Defaults: branch is `<repo>-2`/`-3`/... (deduped against
+  existing branches), path is `<parent>/<repo>-<branch>` (deduped
+  against existing paths and disk).
+- If the cwd already has a live session, a `⚠ session already running
+  in this directory` banner appears between recents and worktrees. We
+  warn but don't block — claws shouldn't refuse what you explicitly
+  asked for.
+- Worktrees are never auto-removed. They're independent git artifacts
+  with their own lifecycle; closing the session leaves the worktree
+  intact for re-attachment later.
+- Enter on an existing worktree row spawns the session in that worktree
+  in one keystroke — no second-Enter to confirm.
+- New-worktree form notes that git auth (gh, ssh keys) needs to be set
+  up if claude will push or fetch inside the worktree.
+- Branch name surfaced as a `branch` row in both the dashboard detail
+  pane and the Details modal. Cached per session; cleared on F5.
+
+### Spawn form
+- Rewrote layout: 3-column left padding, blank rows between sections,
+  shorter labels, footer in the kbd-pill style matching the dashboard.
+- Default cwd is now the most-recently-active session's cwd (falls back
+  to current_dir if no sessions exist).
+- Ghost-text path autocomplete: as you type, the lexicographically first
+  matching subdir appears as dim italic suffix. Right-arrow at end of
+  line accepts. Case-sensitive on Unix, case-insensitive on Windows.
+- Skip-permissions hint moved beneath the flags input (was wedged
+  between cwd and flags).
+- Tab order matches the visual top-to-bottom layout:
+  cwd → worktrees → flags → cwd.
+
+### Security
+- **Per-daemon-startup auth token gates every RPC call.** Closes a gap on
+  Windows where the default named-pipe ACL would have allowed any local
+  user account to connect to your daemon and ask it to spawn `claude`
+  with arbitrary flags as you. The token lives at `state_dir/auth.token`
+  (mode 0600 on Unix; default `%LOCALAPPDATA%` ACL on Windows). Old
+  clients without the token field are rejected with `unauthorized`.
+- Documented threat model in `SECURITY.md`.
+
+### UX
+- Theme picker modal on `t` (live preview, esc reverts, enter saves).
+- Grid view toggle on `g`. Multi-column wall of session cards.
+- Top bar shows aggregate state counts (`3● 1◐ 1★ ✗`).
+- Footer reflects current state: theme name and `g <next-mode>`.
+- Detail pane has a 3-block stats strip (`tokens │ context │ cost`),
+  promoted context bar, quoted-block treatment for the last message.
+- Sidebar entries: louder "needs you" pulse, glyph cycles ★/✦, row-wide
+  bg tint, cwd basename right-aligned. State-transition flash for ~500ms
+  when status changes.
+- Help modal is scrollable with ↑/↓/j/k/PageUp/PageDown.
+- Resume failures surface as `✗ resume failed` rows in the dashboard
+  instead of vanishing silently. Press `x` to forget them.
+- Sessions running with `--dangerously-skip-permissions` get a red `!`
+  indicator in the sidebar, card title, and attached header.
+- Mouse double-click attaches to a session (the `handle_mouse` path was
+  defined but never wired to the run loop until now).
+- `claws_version` field on every RPC; daemon logs version skew.
+
+### Themes
+- All surfaces (detail pane, attached header/footer, modals, cards)
+  consistently use `theme.*` instead of hardcoded colors. The 5-theme
+  story now actually applies everywhere.
+
+### Tests / CI
+- Unit tests for protocol round-trip + legacy-format compat, paths shape,
+  ring buffer, persist store, hook settings + Windows path normalization,
+  auth token I/O + rotation, git porcelain parser + path/branch suggesters.
+  27 tests total.
+- New `.github/workflows/ci.yml` runs `cargo build` + `cargo test` on
+  Linux/macOS/Windows on push and PR. fmt + clippy run advisory.
+
+### Fixed
+- Mouse events were being dropped by the run loop. Now wired to
+  `handle_mouse`, enabling double-click attach.
+- Detail pane's `▎` quote bar painted full-height of the message section
+  even for short messages. Now matches actual content rows.
+
+### Security
+- **Per-daemon-startup auth token gates every RPC call.** Closes a gap on
+  Windows where the default named-pipe ACL would have allowed any local
+  user account to connect to your daemon and ask it to spawn `claude`
+  with arbitrary flags as you. The token lives at `state_dir/auth.token`
+  (mode 0600 on Unix; default `%LOCALAPPDATA%` ACL on Windows). Old
+  clients without the token field are rejected with `unauthorized`.
+- Documented threat model in `SECURITY.md`.
+
+### Added
+- Theme picker modal on `t` (live preview, esc reverts, enter saves).
+- Grid view toggle on `g`. Multi-column wall of session cards.
+- Top bar shows aggregate state counts (`3● 1◐ 1★ ✗`).
+- Footer reflects current state: theme name and `g <next-mode>`.
+- Detail pane has a 3-block stats strip (`tokens │ context │ cost`),
+  promoted context bar, quoted-block treatment for the last message.
+- Sidebar entries: louder "needs you" pulse, glyph cycles ★/✦, row-wide
+  bg tint, cwd basename right-aligned. State-transition flash for ~500ms
+  when status changes.
+- Help modal is scrollable with ↑/↓/j/k/PageUp/PageDown.
+- Spawn form: `[ctrl-y] skip permissions: on/off` indicator above the
+  flags field; recent dirs render as `basename  ~/dim/path`.
+- Resume failures surface as `✗ resume failed` rows in the dashboard
+  instead of vanishing silently. Press `x` to forget them.
+- Mouse double-click attaches to a session.
+- `claws_version` field on every RPC; daemon logs version skew.
+- Unit tests for protocol round-trip, paths, ring buffer, persist store,
+  hook settings, and auth token I/O. CI workflow runs `cargo build` +
+  `cargo test` on Linux/macOS/Windows.
+
+### Changed
+- Detail pane and modals use the active theme throughout (previously the
+  detail pane and several modals hardcoded default-theme colors).
+- Help modal: keys rendered as kbd-style pills, section headers get a
+  `▎` left bar.
+- Theme switching no longer cycles silently — it opens the picker.
+
+### Fixed
+- Mouse events were being dropped by the run loop. Now wired to
+  `handle_mouse`, enabling the existing double-click attach.
+
+## [0.1.6]
+
+- Empty-state ASCII crab and figlet wordmark.
+- Theme system with five built-in themes (default, catppuccin mocha,
+  tokyo night, nord, monochrome).
+- Renamed CLI from `multi-claude` to `claws`.
+
+## [0.1.0]
+
+- Initial public release.

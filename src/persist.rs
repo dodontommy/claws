@@ -26,8 +26,14 @@ impl Store {
         let dir = paths::state_dir()?;
         std::fs::create_dir_all(&dir).ok();
         let path = dir.join("state.sqlite");
+        Self::open_at(&path)
+    }
+
+    /// Open a store at an arbitrary path. Used by tests to avoid touching
+    /// the user's real state dir.
+    pub fn open_at(path: &std::path::Path) -> Result<Self> {
         tracing::info!(path = %path.display(), "opening state store");
-        let conn = Connection::open(&path).context("open sqlite")?;
+        let conn = Connection::open(path).context("open sqlite")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -122,5 +128,57 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("claws-persist-{}.sqlite", Uuid::new_v4().simple()));
+        p
+    }
+
+    #[test]
+    fn insert_then_list_round_trips() {
+        let p = temp_db();
+        let store = Store::open_at(&p).expect("open at temp");
+        let id = Uuid::new_v4();
+        store
+            .insert(id, "/tmp/foo", "foo", Some("sonnet"), 1700000000000, &["--effort".into(), "xhigh".into()])
+            .unwrap();
+        let rows = store.list_resumable().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].name, "foo");
+        assert_eq!(rows[0].extra_args, vec!["--effort".to_string(), "xhigh".to_string()]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn closed_by_user_excludes_from_list() {
+        let p = temp_db();
+        let store = Store::open_at(&p).expect("open at temp");
+        let id = Uuid::new_v4();
+        store
+            .insert(id, "/tmp/bar", "bar", None, 1, &[])
+            .unwrap();
+        store.mark_closed_by_user(id).unwrap();
+        assert!(store.list_resumable().unwrap().is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn display_override_persists() {
+        let p = temp_db();
+        let store = Store::open_at(&p).expect("open at temp");
+        let id = Uuid::new_v4();
+        store.insert(id, "/tmp/baz", "baz", None, 1, &[]).unwrap();
+        store.set_display_override(id, Some("baz-v2")).unwrap();
+        let rows = store.list_resumable().unwrap();
+        assert_eq!(rows[0].display_override.as_deref(), Some("baz-v2"));
+        let _ = std::fs::remove_file(&p);
     }
 }

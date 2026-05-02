@@ -48,6 +48,9 @@ pub struct Session {
     pub cwd: PathBuf,
     pub started_at: SystemTime,
     pub model_requested: Option<String>,
+    /// Extra args this session was spawned with (verbatim). Surfaced in the
+    /// detail/details views and used to flag dangerous flags in the sidebar.
+    pub extra_args: Vec<String>,
     state: Arc<Mutex<SessionRuntime>>,
     display_override: Mutex<Option<String>>,
 }
@@ -203,6 +206,7 @@ pub fn spawn_session(
         cwd,
         started_at: SystemTime::now(),
         model_requested: model,
+        extra_args,
         state: runtime,
         display_override: Mutex::new(None),
     })

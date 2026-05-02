@@ -2,8 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
+mod auth;
 mod client;
 mod daemon;
+mod git;
 mod hook;
 mod paths;
 mod persist;

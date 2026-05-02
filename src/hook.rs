@@ -65,3 +65,43 @@ pub async fn run_hook_emit(session_id: Uuid, event: String) -> Result<()> {
     let _ = crate::client::call_no_spawn_silent("hook_event", params).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn settings_json_has_entry_per_event() {
+        let exe = PathBuf::from("/usr/local/bin/claws");
+        let id = Uuid::new_v4();
+        let v = build_settings_json(&exe, id);
+        let hooks = v.get("hooks").expect("hooks key").as_object().expect("hooks obj");
+        assert_eq!(hooks.len(), EVENTS.len());
+        for ev in EVENTS {
+            assert!(hooks.contains_key(*ev), "missing event {ev}");
+        }
+    }
+
+    #[test]
+    fn settings_json_command_includes_session_id() {
+        let exe = PathBuf::from("/usr/local/bin/claws");
+        let id = Uuid::new_v4();
+        let v = build_settings_json(&exe, id);
+        let serialized = serde_json::to_string(&v).unwrap();
+        assert!(serialized.contains(&id.to_string()), "session id not in output");
+        assert!(serialized.contains("hook-emit"), "hook-emit not in output");
+    }
+
+    #[test]
+    fn settings_json_normalizes_windows_backslashes() {
+        let exe = PathBuf::from(r"C:\Program Files\claws\claws.exe");
+        let id = Uuid::new_v4();
+        let v = build_settings_json(&exe, id);
+        let serialized = serde_json::to_string(&v).unwrap();
+        // The exe path is rewritten with forward slashes so Claude's hook
+        // shell parser doesn't choke on backslashes inside the JSON string.
+        assert!(serialized.contains("C:/Program Files/claws/claws.exe"));
+        assert!(!serialized.contains(r"C:\\Program Files"));
+    }
+}

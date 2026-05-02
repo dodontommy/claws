@@ -23,6 +23,11 @@ use uuid::Uuid;
 // Reserve 1 row each for header and footer in attached view.
 const ATTACHED_CHROME_ROWS: u16 = 2;
 
+// Sessions spawned with this flag get a red `!` indicator in the sidebar so
+// the danger is visible at a glance — bypassing permission prompts means
+// claude can run any tool without asking.
+const DANGEROUS_FLAG: &str = "--dangerously-skip-permissions";
+
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -60,6 +65,13 @@ enum View {
 enum FormField {
     Cwd,
     Args,
+    Worktrees,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WtFormField {
+    Branch,
+    Path,
 }
 
 enum Modal {
@@ -70,6 +82,27 @@ enum Modal {
         args_cursor: usize,
         focus: FormField,
         recent_selected: usize,
+        // Worktree-aware spawn. Recomputed on every cwd change.
+        repo_root: Option<PathBuf>,
+        worktrees: Vec<crate::git::Worktree>,
+        collision: bool,
+        /// 0 = "[+ new worktree]" row; 1..=worktrees.len() = worktrees[idx-1].
+        wt_selected: usize,
+        last_scan_cwd: String,
+        /// Suffix to append to `cwd` to complete it to an existing directory.
+        /// Rendered as dim ghost text after the cursor. None when the typed
+        /// path is already complete or has no unique completion candidate.
+        cwd_completion: Option<String>,
+    },
+    WorktreeNew {
+        repo_root: PathBuf,
+        branch: String,
+        branch_cursor: usize,
+        path: String,
+        path_cursor: usize,
+        focus: WtFormField,
+        /// Last error from `git worktree add`, shown inline. Cleared on edit.
+        error: Option<String>,
     },
     Rename {
         session_id: Uuid,
@@ -79,7 +112,14 @@ enum Modal {
     Details {
         session_id: Uuid,
     },
-    Help,
+    Help {
+        scroll: u16,
+    },
+    ThemePicker {
+        selected_idx: usize,
+        // Theme name active when the picker opened. Esc reverts to this.
+        original_name: String,
+    },
 }
 
 struct App {
@@ -92,12 +132,21 @@ struct App {
     modal: Option<Modal>,
     recent_cwds: Vec<String>,
     grid_cols: u16,
+    grid_mode: bool,
     filter: Option<String>,
     filter_cursor: usize,
     last_click: Option<(usize, SystemTime)>,
     /// Vertical scroll offset for the detail pane's last-message paragraph.
     /// Reset to 0 whenever the selected session changes.
     detail_scroll: u16,
+    /// Per-session monotonically increasing "last status seen" timestamps.
+    /// Used to flash a row briefly when the daemon reports a status change.
+    last_status: std::collections::HashMap<Uuid, (String, SystemTime)>,
+    /// Cached `git rev-parse --abbrev-ref HEAD` per session cwd. Keyed by
+    /// session id and computed once per session lifetime — branches inside
+    /// a session can change, but we re-derive on F5 / daemon restart and
+    /// most worktrees stay on one branch for the duration of a session.
+    session_branches: std::collections::HashMap<Uuid, Option<String>>,
 }
 
 impl App {
@@ -119,10 +168,13 @@ impl App {
             modal: None,
             recent_cwds: recent,
             grid_cols: 1,
+            grid_mode: false,
             filter: None,
             filter_cursor: 0,
             last_click: None,
             detail_scroll: 0,
+            last_status: std::collections::HashMap::new(),
+            session_branches: std::collections::HashMap::new(),
         }
     }
 
@@ -227,6 +279,9 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(key, &mut app).await
                     }
+                    Some(Ok(Event::Mouse(ev))) => {
+                        handle_mouse(ev, &mut app).await
+                    }
                     Some(Ok(Event::Resize(cols, rows))) => {
                     if let View::Attached { session_id, parser, .. } = &mut app.view {
                         let pane_rows = rows.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
@@ -284,6 +339,35 @@ async fn refresh_sessions(app: &mut App) {
                     .cmp(&sort_priority(&b.status))
                     .then_with(|| b.last_activity_ms.cmp(&a.last_activity_ms))
             });
+            // Track per-session status transitions so the sidebar can flash
+            // a row briefly when the daemon reports a state change.
+            let now = SystemTime::now();
+            for s in &list {
+                match app.last_status.get(&s.id) {
+                    None => {
+                        // First sight — record without flashing.
+                        app.last_status.insert(s.id, (s.status.clone(), UNIX_EPOCH));
+                    }
+                    Some((prev, _)) if *prev != s.status => {
+                        app.last_status.insert(s.id, (s.status.clone(), now));
+                    }
+                    _ => {}
+                }
+            }
+            app.last_status.retain(|id, _| list.iter().any(|s| s.id == *id));
+            // Branch cache: populate on first sight, drop on disappearance.
+            for s in &list {
+                if !app.session_branches.contains_key(&s.id) {
+                    let cwd = std::path::Path::new(&s.cwd);
+                    let branch = if cwd.is_dir() {
+                        crate::git::current_branch(cwd)
+                    } else {
+                        None
+                    };
+                    app.session_branches.insert(s.id, branch);
+                }
+            }
+            app.session_branches.retain(|id, _| list.iter().any(|s| s.id == *id));
             app.sessions = list;
             if !app.sessions.is_empty() && app.selected >= app.sessions.len() {
                 app.selected = app.sessions.len() - 1;
@@ -296,11 +380,12 @@ async fn refresh_sessions(app: &mut App) {
 fn sort_priority(status: &str) -> u8 {
     match status {
         "awaiting_permission" => 0,
-        "streaming" => 1,
-        "idle" => 2,
-        "spawning" => 3,
-        "exited" => 4,
-        _ => 5,
+        "resume_failed" => 1,
+        "streaming" => 2,
+        "idle" => 3,
+        "spawning" => 4,
+        "exited" => 5,
+        _ => 6,
     }
 }
 
@@ -361,14 +446,69 @@ async fn handle_mouse(ev: MouseEvent, app: &mut App) {
 }
 
 async fn handle_modal_key(key: KeyEvent, app: &mut App) {
-    // Help modal: any key closes it.
-    if matches!(app.modal, Some(Modal::Help)) {
-        app.modal = None;
+    // Help modal: scroll keys scroll, esc/q/? close, anything else closes too.
+    if let Some(Modal::Help { scroll }) = app.modal.as_mut() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) | (KeyCode::Char('?'), _) => {
+                app.modal = None;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                *scroll = scroll.saturating_sub(1);
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                *scroll = scroll.saturating_add(1);
+            }
+            (KeyCode::PageUp, _) => {
+                *scroll = scroll.saturating_sub(8);
+            }
+            (KeyCode::PageDown, _) => {
+                *scroll = scroll.saturating_add(8);
+            }
+            (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+                *scroll = 0;
+            }
+            _ => {
+                app.modal = None;
+            }
+        }
         return;
     }
     // Details modal: any key closes it.
     if matches!(app.modal, Some(Modal::Details { .. })) {
         app.modal = None;
+        return;
+    }
+    // Theme picker: nav with ↑/↓/j/k, Enter commits, Esc reverts.
+    if let Some(Modal::ThemePicker { selected_idx, original_name }) = app.modal.as_mut() {
+        let n = crate::theme::ALL.len();
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                if let Some(orig) = crate::theme::ALL.iter().find(|t| t.name == *original_name) {
+                    crate::theme::set(orig.clone());
+                }
+                app.modal = None;
+            }
+            (KeyCode::Enter, _) => {
+                let chosen = crate::theme::ALL[*selected_idx].clone();
+                crate::theme::set(chosen.clone());
+                crate::theme::save(&chosen);
+                app.set_status(format!("theme: {}", chosen.label));
+                app.modal = None;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                if *selected_idx > 0 {
+                    *selected_idx -= 1;
+                    crate::theme::set(crate::theme::ALL[*selected_idx].clone());
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                if *selected_idx + 1 < n {
+                    *selected_idx += 1;
+                    crate::theme::set(crate::theme::ALL[*selected_idx].clone());
+                }
+            }
+            _ => {}
+        }
         return;
     }
     // Rename modal: text input + Enter/Esc.
@@ -391,22 +531,77 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App) {
         }
         return;
     }
-    let modal = match app.modal.as_mut() {
-        Some(m) => m,
-        None => return,
-    };
-    match modal {
-        Modal::Help | Modal::Details { .. } | Modal::Rename { .. } => return,
-        Modal::SpawnForm {
-            cwd,
-            cwd_cursor,
-            args,
-            args_cursor,
-            focus,
-            recent_selected,
-        } => match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => app.modal = None,
+    if matches!(app.modal, Some(Modal::SpawnForm { .. })) {
+        handle_spawn_form_key(key, app).await;
+        return;
+    }
+    if matches!(app.modal, Some(Modal::WorktreeNew { .. })) {
+        handle_worktree_new_key(key, app).await;
+        return;
+    }
+}
+
+async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
+    let mut needs_rescan = false;
+
+    if let Some(Modal::SpawnForm {
+        cwd,
+        cwd_cursor,
+        args,
+        args_cursor,
+        focus,
+        recent_selected,
+        repo_root,
+        worktrees,
+        wt_selected,
+        cwd_completion,
+        ..
+    }) = app.modal.as_mut()
+    {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                app.modal = None;
+                return;
+            }
             (KeyCode::Enter, _) => {
+                // [+ new worktree] is a special row that opens the sub-modal
+                // and never falls through to spawn.
+                if *focus == FormField::Worktrees && *wt_selected == 0 {
+                    if let Some(root) = repo_root.clone() {
+                        let suggested_branch = crate::git::suggest_branch_name(
+                            root.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("worktree"),
+                            worktrees,
+                        );
+                        let suggested_path =
+                            crate::git::suggest_worktree_path(&root, &suggested_branch, worktrees);
+                        let path_s = suggested_path.to_string_lossy().into_owned();
+                        let branch_cursor = suggested_branch.len();
+                        let path_cursor = path_s.len();
+                        app.modal = Some(Modal::WorktreeNew {
+                            repo_root: root,
+                            branch: suggested_branch,
+                            branch_cursor,
+                            path: path_s,
+                            path_cursor,
+                            focus: WtFormField::Branch,
+                            error: None,
+                        });
+                        return;
+                    }
+                }
+
+                // Enter on an existing worktree row: populate cwd from that
+                // worktree, then fall through to the normal submit. Single
+                // press → spawn — no second Enter required.
+                if *focus == FormField::Worktrees {
+                    if let Some(wt) = worktrees.get(*wt_selected - 1) {
+                        *cwd = wt.path.to_string_lossy().into_owned();
+                        *cwd_cursor = cwd.len();
+                    }
+                }
+
                 let cwd_v = cwd.trim().to_string();
                 if cwd_v.is_empty() {
                     app.set_status("cwd is empty".into());
@@ -432,11 +627,17 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App) {
                     }
                     Err(e) => app.set_status(format!("create failed: {e}")),
                 }
+                return;
             }
             (KeyCode::Tab, _) => {
-                *focus = match focus {
-                    FormField::Cwd => FormField::Args,
-                    FormField::Args => FormField::Cwd,
+                let has_repo = repo_root.is_some();
+                // Match the visual order top-to-bottom: cwd → worktrees → flags → cwd.
+                // Skip worktrees if the cwd isn't inside a git repo.
+                *focus = match (*focus, has_repo) {
+                    (FormField::Cwd, true) => FormField::Worktrees,
+                    (FormField::Cwd, false) => FormField::Args,
+                    (FormField::Worktrees, _) => FormField::Args,
+                    (FormField::Args, _) => FormField::Cwd,
                 };
             }
             (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -462,6 +663,7 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App) {
                     if let Some(pick) = app.recent_cwds.get(*recent_selected) {
                         *cwd = pick.clone();
                         *cwd_cursor = cwd.len();
+                        needs_rescan = true;
                     }
                 }
             }
@@ -471,17 +673,143 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App) {
                     if let Some(pick) = app.recent_cwds.get(*recent_selected) {
                         *cwd = pick.clone();
                         *cwd_cursor = cwd.len();
+                        needs_rescan = true;
                     }
                 }
             }
+            (KeyCode::Up, _) if *focus == FormField::Worktrees => {
+                if *wt_selected > 0 {
+                    *wt_selected -= 1;
+                }
+            }
+            (KeyCode::Down, _) if *focus == FormField::Worktrees => {
+                let max = worktrees.len();
+                if *wt_selected < max {
+                    *wt_selected += 1;
+                }
+            }
+            // Right-arrow at end of cwd accepts the ghost-text completion.
+            // Anywhere else, falls through to the normal text-input handler
+            // which moves the cursor right.
+            (KeyCode::Right, _)
+                if *focus == FormField::Cwd && *cwd_cursor == cwd.len() =>
+            {
+                if let Some(suffix) = cwd_completion.clone() {
+                    cwd.push_str(&suffix);
+                    *cwd_cursor = cwd.len();
+                    needs_rescan = true;
+                }
+            }
             _ => {
+                let cwd_was = cwd.clone();
                 let (input, cursor) = match focus {
-                    FormField::Cwd => (cwd, cwd_cursor),
-                    FormField::Args => (args, args_cursor),
+                    FormField::Cwd => (&mut *cwd, &mut *cwd_cursor),
+                    FormField::Args => (&mut *args, &mut *args_cursor),
+                    FormField::Worktrees => return,
+                };
+                handle_text_input(input, cursor, &key);
+                if *focus == FormField::Cwd && *cwd != cwd_was {
+                    needs_rescan = true;
+                }
+            }
+        }
+    }
+
+    if needs_rescan {
+        rescan_spawn_form(app);
+    }
+}
+
+async fn handle_worktree_new_key(key: KeyEvent, app: &mut App) {
+    // Snapshot inputs so we can act on them after taking the modal.
+    let snapshot = if let Some(Modal::WorktreeNew {
+        repo_root,
+        branch,
+        path,
+        ..
+    }) = app.modal.as_ref()
+    {
+        Some((repo_root.clone(), branch.clone(), path.clone()))
+    } else {
+        None
+    };
+
+    if let Some(Modal::WorktreeNew {
+        branch,
+        branch_cursor,
+        path,
+        path_cursor,
+        focus,
+        error,
+        ..
+    }) = app.modal.as_mut()
+    {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                // Drop the new-worktree modal; spawn form remains as-is.
+                app.modal = None;
+                // Re-open the spawn form with the previous state? We dropped
+                // it when we transitioned. Simpler: nothing to restore for now;
+                // user re-presses `c`. (See note in CHANGELOG; could be improved.)
+                return;
+            }
+            (KeyCode::Tab, _) => {
+                *focus = match focus {
+                    WtFormField::Branch => WtFormField::Path,
+                    WtFormField::Path => WtFormField::Branch,
+                };
+                return;
+            }
+            (KeyCode::Enter, _) => {
+                let (root, b, p) = match snapshot {
+                    Some(t) => t,
+                    None => return,
+                };
+                let b = b.trim().to_string();
+                let p = p.trim().to_string();
+                if b.is_empty() {
+                    *error = Some("branch name is empty".into());
+                    return;
+                }
+                if p.is_empty() {
+                    *error = Some("path is empty".into());
+                    return;
+                }
+                let path_buf = PathBuf::from(&p);
+                if let Err(e) = crate::git::create_worktree(&root, &b, &path_buf) {
+                    *error = Some(format!("{e:#}"));
+                    return;
+                }
+                // Worktree created — re-open the spawn form with cwd set
+                // to the new path so the user can immediately spawn there.
+                let cursor = p.len();
+                app.modal = Some(Modal::SpawnForm {
+                    cwd: p.clone(),
+                    cwd_cursor: cursor,
+                    args: String::new(),
+                    args_cursor: 0,
+                    focus: FormField::Cwd,
+                    recent_selected: 0,
+                    repo_root: None,
+                    worktrees: Vec::new(),
+                    collision: false,
+                    wt_selected: 0,
+                    last_scan_cwd: String::new(),
+                    cwd_completion: None,
+                });
+                rescan_spawn_form(app);
+                app.set_status(format!("worktree '{b}' created at {p}"));
+                return;
+            }
+            _ => {
+                *error = None;
+                let (input, cursor) = match focus {
+                    WtFormField::Branch => (branch, branch_cursor),
+                    WtFormField::Path => (path, path_cursor),
                 };
                 handle_text_input(input, cursor, &key);
             }
-        },
+        }
     }
 }
 
@@ -610,10 +938,21 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
         (KeyCode::Char('K'), KeyModifiers::SHIFT) => {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
         }
-        (KeyCode::Char('?'), _) => app.modal = Some(Modal::Help),
+        (KeyCode::Char('?'), _) => app.modal = Some(Modal::Help { scroll: 0 }),
+        (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            app.grid_mode = !app.grid_mode;
+            app.set_status(if app.grid_mode { "grid view".into() } else { "sidebar view".into() });
+        }
         (KeyCode::Char('t'), KeyModifiers::NONE) => {
-            let t = crate::theme::cycle();
-            app.set_status(format!("theme: {}", t.label));
+            let cur = crate::theme::current();
+            let idx = crate::theme::ALL
+                .iter()
+                .position(|t| t.name == cur.name)
+                .unwrap_or(0);
+            app.modal = Some(Modal::ThemePicker {
+                selected_idx: idx,
+                original_name: cur.name.to_string(),
+            });
         }
         (KeyCode::Char('/'), _) => {
             app.filter = Some(String::new());
@@ -653,22 +992,42 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
             }
         }
         (KeyCode::F(5), _) => {
+            // Clear caches so branch lookups + state diffs re-derive fresh.
+            app.session_branches.clear();
             refresh_sessions(app).await;
             app.set_status("refreshed".into());
         }
         (KeyCode::Char('c'), KeyModifiers::NONE) => {
-            let pwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().into_owned())
+            // Default cwd: the most-recently-active session's cwd if any,
+            // otherwise the shell's current dir. Matches the common pattern
+            // of "spawn a sibling of what I was just doing."
+            let default_cwd = app
+                .sessions
+                .iter()
+                .max_by_key(|s| s.last_activity_ms)
+                .map(|s| s.cwd.clone())
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
                 .unwrap_or_default();
-            let cursor = pwd.len();
+            let cursor = default_cwd.len();
             app.modal = Some(Modal::SpawnForm {
-                cwd: pwd,
+                cwd: default_cwd,
                 cwd_cursor: cursor,
                 args: String::new(),
                 args_cursor: 0,
                 focus: FormField::Cwd,
                 recent_selected: 0,
+                repo_root: None,
+                worktrees: Vec::new(),
+                collision: false,
+                wt_selected: 0,
+                last_scan_cwd: String::new(),
+                cwd_completion: None,
             });
+            rescan_spawn_form(app);
         }
         (KeyCode::Char('x'), KeyModifiers::NONE) => {
             if let Some(s) = app.selected_session() {
@@ -696,6 +1055,10 @@ async fn attach_at_index(app: &mut App, idx: usize) {
     };
     if info.status == "exited" {
         app.set_status("session exited; can't attach".into());
+        return;
+    }
+    if info.status == "resume_failed" {
+        app.set_status("resume failed; press i for details, x to forget".into());
         return;
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -950,6 +1313,12 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
             args_cursor,
             focus,
             recent_selected,
+            repo_root,
+            worktrees,
+            collision,
+            wt_selected,
+            cwd_completion,
+            ..
         } => draw_spawn_form(
             f,
             cwd,
@@ -959,52 +1328,176 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
             *focus,
             *recent_selected,
             &app.recent_cwds,
+            repo_root.as_deref(),
+            worktrees,
+            *collision,
+            *wt_selected,
+            cwd_completion.as_deref(),
         ),
-        Modal::Help => draw_help(f),
-        Modal::Rename { input, cursor, .. } => draw_rename(f, input, *cursor),
+        Modal::WorktreeNew {
+            repo_root,
+            branch,
+            branch_cursor,
+            path,
+            path_cursor,
+            focus,
+            error,
+        } => draw_worktree_new(
+            f,
+            repo_root,
+            branch,
+            *branch_cursor,
+            path,
+            *path_cursor,
+            *focus,
+            error.as_deref(),
+        ),
+        Modal::Help { scroll } => draw_help(f, *scroll),
+        Modal::Rename { input, cursor, session_id } => {
+            let placeholder = app
+                .sessions
+                .iter()
+                .find(|s| s.id == *session_id)
+                .map(|s| {
+                    s.display_override
+                        .clone()
+                        .or_else(|| s.ai_title.clone())
+                        .unwrap_or_else(|| s.name.clone())
+                })
+                .unwrap_or_default();
+            draw_rename(f, input, *cursor, &placeholder);
+        }
         Modal::Details { session_id } => {
             if let Some(s) = app.sessions.iter().find(|s| s.id == *session_id) {
-                draw_details(f, s);
+                let branch = app
+                    .session_branches
+                    .get(session_id)
+                    .and_then(|b| b.clone());
+                draw_details(f, s, branch.as_deref());
             } else {
-                draw_help(f);
+                draw_help(f, 0);
             }
         }
+        Modal::ThemePicker { selected_idx, .. } => draw_theme_picker(f, *selected_idx),
     }
 }
 
-fn draw_help(f: &mut ratatui::Frame) {
+fn draw_theme_picker(f: &mut ratatui::Frame, selected_idx: usize) {
+    let theme = crate::theme::current();
+    let parent = f.area();
+    let n = crate::theme::ALL.len();
+    let w = 50.min(parent.width.saturating_sub(4));
+    let h = (n as u16) + 5;
+    let area = centered_rect(w, h, parent);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(ratatui::text::Span::styled(
+            " theme ",
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    use ratatui::text::{Line, Span};
+
+    for (i, t) in crate::theme::ALL.iter().enumerate() {
+        let active = i == selected_idx;
+        let marker = if active { "› " } else { "  " };
+        let marker_style = if active {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        let label_style = if active {
+            Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.body)
+        };
+        let label = format!("{:<18}", t.label);
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::styled(label, label_style),
+            Span::styled("  ", Style::default().fg(theme.dim)),
+        ];
+        // Five color swatches drawn from the theme's palette.
+        for c in [t.idle, t.working, t.awaiting_a, t.accent, t.cost] {
+            spans.push(Span::styled(
+                "● ",
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x + 1, inner.y + 1 + i as u16, inner.width.saturating_sub(2), 1),
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(" ↑/↓ preview  ·  enter save  ·  esc revert")
+            .style(Style::default().fg(theme.dim)),
+        Rect::new(
+            inner.x + 1,
+            inner.y + inner.height.saturating_sub(2),
+            inner.width.saturating_sub(2),
+            1,
+        ),
+    );
+}
+
+fn draw_help(f: &mut ratatui::Frame, scroll: u16) {
+    let theme = crate::theme::current();
     let parent = f.area();
     let w = 78.min(parent.width.saturating_sub(4));
-    let h = 38.min(parent.height.saturating_sub(2));
+    let h = 42.min(parent.height.saturating_sub(2));
     let area = centered_rect(w, h, parent);
     f.render_widget(Clear, area);
     let title = format!(" claws {}  ·  keymap ", env!("CARGO_PKG_VERSION"));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.accent))
         .title(ratatui::text::Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     use ratatui::text::{Line, Span};
-    let key_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(Color::White);
-    let dim_style = Style::default().fg(Color::DarkGray);
+    let kbd_style = Style::default()
+        .fg(theme.title)
+        .bg(theme.awaiting_bg)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(theme.body);
+    let dim_style = Style::default().fg(theme.dim);
 
+    // Section header: ▎ in theme.accent + bold label.
     let sec = |label: &'static str| -> Line<'static> {
-        Line::from(Span::styled(
-            label.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))
+        Line::from(vec![
+            Span::styled(
+                "▎ ",
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                label.to_string(),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+        ])
     };
+    // Render keys with a kbd-like padded bg pill, then description.
     let row = |k: &str, v: &str| -> Line<'static> {
+        let pill = format!(" {k} ");
+        let pill_w = pill.chars().count();
+        // Pad after the pill out to column 24 so descriptions align.
+        let pad_target = 24usize;
+        let pad = pad_target.saturating_sub(pill_w + 2);
         Line::from(vec![
             Span::styled("  ", dim_style),
-            Span::styled(format!("{k:<22}"), key_style),
+            Span::styled(pill, kbd_style),
+            Span::styled(" ".repeat(pad), dim_style),
             Span::styled(v.to_string(), desc_style),
         ])
     };
@@ -1014,14 +1507,16 @@ fn draw_help(f: &mut ratatui::Frame) {
     lines.push(sec("dashboard"));
     lines.push(row("h j k l / arrows", "navigate sessions"));
     lines.push(row("enter", "attach to selected session"));
+    lines.push(row("dbl-click", "attach to clicked session"));
     lines.push(row("c", "new session (opens spawn form)"));
+    lines.push(row("g", "toggle grid / sidebar layout"));
     lines.push(row("r", "rename selected"));
     lines.push(row("R", "restart selected (kill + claude --resume)"));
     lines.push(row("x", "close & forget selected"));
     lines.push(row("/", "filter sessions"));
     lines.push(row("i", "session details popup"));
     lines.push(row("F5", "force refresh"));
-    lines.push(row("t", "cycle color theme"));
+    lines.push(row("t", "open theme picker"));
     lines.push(row("?", "this help"));
     lines.push(row("q", "quit TUI  (daemon and sessions stay alive)"));
 
@@ -1045,11 +1540,21 @@ fn draw_help(f: &mut ratatui::Frame) {
 
     lines.push(Line::from(""));
     lines.push(sec("spawn form  (c)"));
-    lines.push(row("tab", "switch between cwd and flags fields"));
+    lines.push(row("tab", "cycle cwd → worktrees → flags → cwd"));
     lines.push(row("↑ / ↓  (cwd field)", "cycle recent directories"));
+    lines.push(row("↑ / ↓  (worktrees field)", "cycle worktrees"));
+    lines.push(row("→  (cwd, end of line)", "accept ghost-text path completion"));
     lines.push(row("Ctrl-Y", "toggle --dangerously-skip-permissions"));
-    lines.push(row("enter", "create"));
+    lines.push(row("enter (cwd/flags)", "spawn the session"));
+    lines.push(row("enter (worktree)", "spawn in that worktree"));
+    lines.push(row("enter ([+ new])", "open the new-worktree form"));
     lines.push(row("esc", "cancel"));
+
+    lines.push(Line::from(""));
+    lines.push(sec("worktrees"));
+    lines.push(row("(any git repo)", "spawn form lists worktrees automatically"));
+    lines.push(row("[+ new worktree]", "branch off HEAD into a new sibling dir"));
+    lines.push(row("git auth", "needed only if claude pushes/fetches inside the worktree"));
 
     lines.push(Line::from(""));
     lines.push(sec("from the shell  (outside the TUI)"));
@@ -1061,19 +1566,39 @@ fn draw_help(f: &mut ratatui::Frame) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  press any key to close",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
+        "  ↑/↓ scroll  ·  esc to close",
+        Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
     )));
 
+    // Reserve the bottom row of the modal for a sticky scroll hint so it
+    // doesn't disappear when the user scrolls down past the end of content.
+    let total_lines = lines.len() as u16;
+    let body_h = inner.height.saturating_sub(1);
+    let max_scroll = total_lines.saturating_sub(body_h);
+    let clamped = scroll.min(max_scroll);
+
     f.render_widget(
-        Paragraph::new(lines),
-        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height),
+        Paragraph::new(lines).scroll((clamped, 0)),
+        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), body_h),
+    );
+
+    // Bottom-anchored sticky hint with scroll position.
+    let hint = if max_scroll == 0 {
+        " esc to close ".to_string()
+    } else {
+        let pct = if max_scroll == 0 { 100 } else { (clamped as u32 * 100) / max_scroll as u32 };
+        format!(" ↑/↓ scroll · {pct}% · esc to close ")
+    };
+    let hint_w = hint.chars().count() as u16;
+    let hint_x = inner.x + inner.width.saturating_sub(hint_w + 1);
+    f.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(theme.dim)),
+        Rect::new(hint_x, inner.y + inner.height.saturating_sub(1), hint_w, 1),
     );
 }
 
-fn draw_rename(f: &mut ratatui::Frame, input: &str, cursor: usize) {
+fn draw_rename(f: &mut ratatui::Frame, input: &str, cursor: usize, placeholder: &str) {
+    let theme = crate::theme::current();
     let parent = f.area();
     let w = 60.min(parent.width.saturating_sub(4));
     let h = 5;
@@ -1082,53 +1607,62 @@ fn draw_rename(f: &mut ratatui::Frame, input: &str, cursor: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.accent))
         .title(ratatui::text::Span::styled(
             " rename ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let row = Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1);
-    f.render_widget(
-        Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
-        row,
-    );
+    if input.is_empty() && !placeholder.is_empty() {
+        f.render_widget(
+            Paragraph::new(placeholder.to_string())
+                .style(Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)),
+            row,
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(input.to_string()).style(Style::default().fg(theme.title)),
+            row,
+        );
+    }
     f.set_cursor_position(Position::new(row.x + cursor as u16, row.y));
     f.render_widget(
         Paragraph::new(" enter save  ·  esc cancel  ·  blank reverts to ai_title")
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(theme.dim)),
         Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
     );
 }
 
-fn draw_details(f: &mut ratatui::Frame, s: &SessionInfo) {
+fn draw_details(f: &mut ratatui::Frame, s: &SessionInfo, branch: Option<&str>) {
+    let theme = crate::theme::current();
     let parent = f.area();
     let w = 80.min(parent.width.saturating_sub(4));
     let h = 18.min(parent.height.saturating_sub(2));
     let area = centered_rect(w, h, parent);
     f.render_widget(Clear, area);
-    let color = status_color(&s.status);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.accent))
         .title(ratatui::text::Span::styled(
             format!(" details — {} ", s.id),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     use ratatui::text::{Line, Span};
-    let label = Style::default().fg(Color::DarkGray);
-    let val = Style::default().fg(Color::White);
+    let label = Style::default().fg(theme.dim);
+    let val = Style::default().fg(theme.body);
     let mut lines: Vec<Line> = Vec::new();
-    let row = |k: &'static str, v: String| -> Line<'static> {
+    // Match the dashboard detail pane: 10-col label width.
+    let row = |k: &'static str, v: String, vstyle: Style| -> Line<'static> {
         Line::from(vec![
-            Span::styled(format!("  {:<14}", k), label),
-            Span::styled(v, val),
+            Span::styled(format!("  {:<10}", k), label),
+            Span::styled(v, vstyle),
         ])
     };
 
@@ -1137,20 +1671,37 @@ fn draw_details(f: &mut ratatui::Frame, s: &SessionInfo) {
         .clone()
         .or_else(|| s.ai_title.clone())
         .unwrap_or_else(|| s.name.clone());
-    lines.push(row("title", title));
-    lines.push(row("name", s.name.clone()));
-    lines.push(row("status", s.status.clone()));
+    lines.push(row("title", title, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)));
+    lines.push(row("name", s.name.clone(), val));
+    lines.push(row("status", s.status.clone(), Style::default().fg(status_color(&s.status))));
     if let Some(c) = s.exit_code {
-        lines.push(row("exit code", c.to_string()));
+        lines.push(row("exit", c.to_string(), val));
     }
-    lines.push(row("cwd", s.cwd.clone()));
+    lines.push(row("cwd", s.cwd.clone(), Style::default().fg(theme.cwd)));
+    if let Some(b) = branch {
+        lines.push(row(
+            "branch",
+            b.to_string(),
+            Style::default().fg(theme.idle).add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(m) = &s.model {
-        lines.push(row("model", m.clone()));
+        lines.push(row("model", m.clone(), Style::default().fg(theme.model)));
     }
     if let Some(t) = &s.current_tool {
-        lines.push(row("running tool", t.clone()));
+        lines.push(row("tool", t.clone(), Style::default().fg(theme.tool)));
     }
-    lines.push(row("turns", s.turn_count.to_string()));
+    if !s.extra_args.is_empty() {
+        let joined = s.extra_args.join(" ");
+        let dangerous = s.extra_args.iter().any(|a| a == DANGEROUS_FLAG);
+        let style = if dangerous {
+            Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.body)
+        };
+        lines.push(row("flags", joined, style));
+    }
+    lines.push(row("turns", s.turn_count.to_string(), val));
     lines.push(row(
         "tokens",
         format!(
@@ -1159,24 +1710,24 @@ fn draw_details(f: &mut ratatui::Frame, s: &SessionInfo) {
             compact_num(s.tokens_output),
             compact_num(s.tokens_cache_read)
         ),
+        val,
     ));
-    lines.push(row("started", format_time_ago(s.started_at_ms)));
-    lines.push(row("last seen", format_time_ago(s.last_activity_ms)));
+    lines.push(row("started", format_time_ago(s.started_at_ms), val));
+    lines.push(row("last seen", format_time_ago(s.last_activity_ms), val));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  last message",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", s.last_message.as_deref().unwrap_or("(none)")),
-        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
-    )));
+    lines.push(Line::from(Span::styled("  last message", label)));
+    lines.push(Line::from(vec![
+        Span::styled("  ▎ ", Style::default().fg(theme.dim)),
+        Span::styled(
+            s.last_message.as_deref().unwrap_or("(none)").to_string(),
+            Style::default().fg(theme.body).add_modifier(Modifier::ITALIC),
+        ),
+    ]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  press any key to close",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
     )));
-    let _ = color;
 
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -1193,43 +1744,401 @@ fn draw_spawn_form(
     focus: FormField,
     recent_selected: usize,
     recent: &[String],
+    repo_root: Option<&std::path::Path>,
+    worktrees: &[crate::git::Worktree],
+    collision: bool,
+    wt_selected: usize,
+    cwd_completion: Option<&str>,
 ) {
+    use ratatui::text::{Line, Span};
+    let theme = crate::theme::current();
     let parent = f.area();
-    let w = 80.min(parent.width.saturating_sub(4));
-    let recent_rows = recent.len().min(6) as u16;
-    // 9 fixed rows (label/input/gap/label/input/examples/sep/label/help) +
-    // recent_rows + 2 for borders. Previously omitted the +2, so ratatui
-    // collapsed the args-input row to zero height — typed text was rendering
-    // behind the examples line.
-    let h = 11 + recent_rows;
+    let w = 84.min(parent.width.saturating_sub(4));
+
+    // Cap visible rows per section.
+    let recents_shown: u16 = recent.len().min(3) as u16;
+    let wt_count_shown: u16 = worktrees.len().min(5) as u16;
+    let has_repo = repo_root.is_some();
+    let has_recents = recents_shown > 0;
+
+    // Pre-compute the row plan as a list of "row kinds" + heights so the
+    // padding logic is uniform: every section is preceded by a single
+    // blank row (except the first), and every section is `(label, body)`
+    // with no internal gaps.
+    enum RowKind {
+        Pad,
+        DirLabel,
+        DirInput,
+        RecentLabel,
+        RecentList,
+        CollisionBanner,
+        WtLabel,
+        WtList,
+        FlagsLabel,
+        FlagsInput,
+        SkipHint,
+        Examples,
+        FooterHelp,
+    }
+
+    let mut plan: Vec<(RowKind, u16)> = Vec::new();
+    plan.push((RowKind::Pad, 1));
+    plan.push((RowKind::DirLabel, 1));
+    plan.push((RowKind::DirInput, 1));
+    if has_recents {
+        plan.push((RowKind::Pad, 1));
+        plan.push((RowKind::RecentLabel, 1));
+        plan.push((RowKind::RecentList, recents_shown));
+    }
+    if collision {
+        plan.push((RowKind::Pad, 1));
+        plan.push((RowKind::CollisionBanner, 1));
+    }
+    if has_repo {
+        plan.push((RowKind::Pad, 1));
+        plan.push((RowKind::WtLabel, 1));
+        plan.push((RowKind::WtList, 1 + wt_count_shown));
+    }
+    plan.push((RowKind::Pad, 1));
+    plan.push((RowKind::FlagsLabel, 1));
+    plan.push((RowKind::FlagsInput, 1));
+    plan.push((RowKind::SkipHint, 1));
+    plan.push((RowKind::Examples, 1));
+    plan.push((RowKind::Pad, 1));
+    plan.push((RowKind::FooterHelp, 1));
+    plan.push((RowKind::Pad, 1));
+
+    let inner_h: u16 = plan.iter().map(|(_, h)| *h).sum();
+    let h = inner_h + 2; // borders
     let area = centered_rect(w, h, parent);
 
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.accent))
         .title(ratatui::text::Span::styled(
             " spawn session ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // 3-col left padding (1 from inner + 2 of breathing).
+    let content_x = inner.x + 3;
+    let content_w = inner.width.saturating_sub(6); // 3 each side
+
+    let constraints: Vec<Constraint> =
+        plan.iter().map(|(_, h)| Constraint::Length(*h)).collect();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // cwd label
-            Constraint::Length(1), // cwd input
-            Constraint::Length(1), // gap
-            Constraint::Length(1), // args label
-            Constraint::Length(1), // args input
-            Constraint::Length(1), // args examples
-            Constraint::Length(1), // separator
-            Constraint::Length(1), // recent label
-            Constraint::Min(1),    // recent list
-            Constraint::Length(1), // help
-        ])
+        .constraints(constraints)
+        .split(Rect::new(
+            content_x,
+            inner.y,
+            content_w,
+            inner.height,
+        ));
+
+    let label_dim = Style::default().fg(theme.dim);
+    let label_active = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+
+    // Track input row indices for cursor placement.
+    let mut idx_dir_input: Option<usize> = None;
+    let mut idx_flags_input: Option<usize> = None;
+
+    for (i, (kind, _)) in plan.iter().enumerate() {
+        let area = chunks[i];
+        match kind {
+            RowKind::Pad => {}
+            RowKind::DirLabel => {
+                f.render_widget(
+                    Paragraph::new("directory").style(if focus == FormField::Cwd {
+                        label_active
+                    } else {
+                        label_dim
+                    }),
+                    area,
+                );
+            }
+            RowKind::DirInput => {
+                idx_dir_input = Some(i);
+                let mut spans: Vec<Span<'static>> = vec![Span::styled(
+                    cwd.to_string(),
+                    Style::default().fg(theme.title),
+                )];
+                if focus == FormField::Cwd {
+                    if let Some(suffix) = cwd_completion {
+                        if !suffix.is_empty() {
+                            spans.push(Span::styled(
+                                suffix.to_string(),
+                                Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                            ));
+                        }
+                    }
+                }
+                f.render_widget(Paragraph::new(Line::from(spans)), area);
+            }
+            RowKind::RecentLabel => {
+                f.render_widget(
+                    Paragraph::new("recent").style(label_dim),
+                    area,
+                );
+            }
+            RowKind::RecentList => {
+                let inner_w = area.width as usize;
+                for (j, dir) in recent.iter().take(recents_shown as usize).enumerate() {
+                    let y = area.y + j as u16;
+                    let active = j == recent_selected && focus == FormField::Cwd;
+                    let marker = if active { "› " } else { "  " };
+                    let marker_style = if active {
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.dim)
+                    };
+                    let basename = cwd_basename(dir);
+                    let display_path = shorten_home(dir);
+                    let bn = format!("{:<16}", truncate_ellipsis(&basename, 16));
+                    let bn_w = bn.chars().count();
+                    let path_avail = inner_w.saturating_sub(bn_w + 2 + 2);
+                    let path_short = truncate_ellipsis(&display_path, path_avail);
+                    let name_style = if active {
+                        Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.body)
+                    };
+                    let path_style = Style::default().fg(theme.dim);
+                    let line = Line::from(vec![
+                        Span::styled(marker.to_string(), marker_style),
+                        Span::styled(bn, name_style),
+                        Span::styled("  ", path_style),
+                        Span::styled(path_short, path_style),
+                    ]);
+                    f.render_widget(
+                        Paragraph::new(line),
+                        Rect::new(area.x, y, area.width, 1),
+                    );
+                }
+            }
+            RowKind::CollisionBanner => {
+                f.render_widget(
+                    Paragraph::new("⚠  session already running in this directory")
+                        .style(Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)),
+                    area,
+                );
+            }
+            RowKind::WtLabel => {
+                let repo_label = repo_root
+                    .and_then(|r| r.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let style = if focus == FormField::Worktrees { label_active } else { label_dim };
+                f.render_widget(
+                    Paragraph::new(format!("worktrees · {repo_label}")).style(style),
+                    area,
+                );
+            }
+            RowKind::WtList => {
+                // Row 0: [+ new worktree]
+                let new_active = wt_selected == 0 && focus == FormField::Worktrees;
+                let new_marker = if new_active { "› " } else { "  " };
+                let marker_style = if new_active {
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.dim)
+                };
+                let new_label_style = if new_active {
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.accent)
+                };
+                let new_line = Line::from(vec![
+                    Span::styled(new_marker.to_string(), marker_style),
+                    Span::styled("[+ new worktree]", new_label_style),
+                ]);
+                f.render_widget(
+                    Paragraph::new(new_line),
+                    Rect::new(area.x, area.y, area.width, 1),
+                );
+
+                let inner_w = area.width as usize;
+                for (j, wt) in worktrees.iter().take(wt_count_shown as usize).enumerate() {
+                    let y = area.y + 1 + j as u16;
+                    let active = focus == FormField::Worktrees && wt_selected == j + 1;
+                    let is_current = paths_equal(&wt.path.to_string_lossy(), cwd);
+                    let marker = if active { "› " } else { "  " };
+                    let marker_style = if active {
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.dim)
+                    };
+                    let branch = wt.branch.clone().unwrap_or_else(|| "(detached)".into());
+                    let branch_padded = format!("{:<16}", truncate_ellipsis(&branch, 16));
+                    let path_str = wt.path.to_string_lossy().into_owned();
+                    let path_disp = shorten_home(&path_str);
+                    let bn_w = branch_padded.chars().count();
+                    let suffix = if is_current { "  (current)" } else { "" };
+                    let suffix_w = suffix.chars().count();
+                    let path_avail = inner_w.saturating_sub(bn_w + 2 + suffix_w + 2);
+                    let path_short = truncate_ellipsis(&path_disp, path_avail);
+                    let branch_style = if active {
+                        Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.model)
+                    };
+                    let path_style = Style::default().fg(theme.dim);
+                    let suffix_style = Style::default().fg(theme.idle).add_modifier(Modifier::ITALIC);
+                    let line = Line::from(vec![
+                        Span::styled(marker.to_string(), marker_style),
+                        Span::styled(branch_padded, branch_style),
+                        Span::styled("  ", path_style),
+                        Span::styled(path_short, path_style),
+                        Span::styled(suffix.to_string(), suffix_style),
+                    ]);
+                    f.render_widget(
+                        Paragraph::new(line),
+                        Rect::new(area.x, y, area.width, 1),
+                    );
+                }
+            }
+            RowKind::FlagsLabel => {
+                f.render_widget(
+                    Paragraph::new("flags").style(if focus == FormField::Args {
+                        label_active
+                    } else {
+                        label_dim
+                    }),
+                    area,
+                );
+            }
+            RowKind::FlagsInput => {
+                idx_flags_input = Some(i);
+                let display = if args.is_empty() {
+                    if focus == FormField::Args {
+                        String::new()
+                    } else {
+                        "(none)".to_string()
+                    }
+                } else {
+                    args.to_string()
+                };
+                let style = if args.is_empty() && focus != FormField::Args {
+                    Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(theme.title)
+                };
+                f.render_widget(Paragraph::new(display).style(style), area);
+            }
+            RowKind::SkipHint => {
+                let skip_flag = "--dangerously-skip-permissions";
+                let skip_on = args.split_whitespace().any(|t| t == skip_flag);
+                let state_style = if skip_on {
+                    Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.dim)
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        "ctrl-y ",
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("skip permissions: ", Style::default().fg(theme.dim)),
+                    Span::styled(if skip_on { "on" } else { "off" }, state_style),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
+            }
+            RowKind::Examples => {
+                f.render_widget(
+                    Paragraph::new("examples: --effort xhigh · -p \"…\" · --add-dir <path>")
+                        .style(Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)),
+                    area,
+                );
+            }
+            RowKind::FooterHelp => {
+                let key = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+                let desc = Style::default().fg(theme.dim);
+                let pair = |k: &'static str, v: &'static str| -> [Span<'static>; 3] {
+                    [
+                        Span::styled(k.to_string(), key),
+                        Span::raw(" "),
+                        Span::styled(v.to_string(), desc),
+                    ]
+                };
+                let gap = || Span::styled("    ", desc);
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                spans.extend(pair("enter", "create"));
+                spans.push(gap());
+                spans.extend(pair("tab", "next field"));
+                spans.push(gap());
+                spans.extend(pair("↑↓", "navigate"));
+                spans.push(gap());
+                spans.extend(pair("esc", "cancel"));
+                f.render_widget(Paragraph::new(Line::from(spans)), area);
+            }
+        }
+    }
+
+    // Cursor placement (after rendering).
+    match (focus, idx_dir_input, idx_flags_input) {
+        (FormField::Cwd, Some(i), _) => {
+            let row = chunks[i];
+            f.set_cursor_position(Position::new(row.x + cwd_cursor as u16, row.y));
+        }
+        (FormField::Args, _, Some(i)) => {
+            let row = chunks[i];
+            f.set_cursor_position(Position::new(row.x + args_cursor as u16, row.y));
+        }
+        _ => {}
+    }
+}
+
+fn draw_worktree_new(
+    f: &mut ratatui::Frame,
+    repo_root: &std::path::Path,
+    branch: &str,
+    branch_cursor: usize,
+    path: &str,
+    path_cursor: usize,
+    focus: WtFormField,
+    error: Option<&str>,
+) {
+    let theme = crate::theme::current();
+    let parent = f.area();
+    let w = 80.min(parent.width.saturating_sub(4));
+    let h: u16 = if error.is_some() { 12 } else { 11 };
+    let area = centered_rect(w, h, parent);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(ratatui::text::Span::styled(
+            " new worktree ",
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    use ratatui::text::{Line, Span};
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(1), // 0 repo label
+        Constraint::Length(1), // 1 branch label
+        Constraint::Length(1), // 2 branch input
+        Constraint::Length(1), // 3 path label
+        Constraint::Length(1), // 4 path input
+        Constraint::Length(1), // 5 gap
+        Constraint::Length(1), // 6 git auth tip
+        Constraint::Length(1), // 7 help footer
+    ];
+    let mut idx_error: Option<usize> = None;
+    if error.is_some() {
+        idx_error = Some(constraints.len());
+        constraints.push(Constraint::Length(1));
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(Rect::new(
             inner.x + 1,
             inner.y,
@@ -1237,120 +2146,72 @@ fn draw_spawn_form(
             inner.height,
         ));
 
-    let label_dim = Style::default().fg(Color::DarkGray);
-    let label_active = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let working_dir_label = if focus == FormField::Cwd { "working directory" } else { "working directory" };
-    let flags_label = if focus == FormField::Args { "claude flags" } else { "claude flags" };
+    let label_dim = Style::default().fg(theme.dim);
+    let label_active = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
 
+    let repo_short = shorten_home(&repo_root.to_string_lossy());
     f.render_widget(
-        Paragraph::new(working_dir_label)
-            .style(if focus == FormField::Cwd { label_active } else { label_dim }),
+        Paragraph::new(Line::from(vec![
+            Span::styled("repo ", label_dim),
+            Span::styled(repo_short, Style::default().fg(theme.cwd)),
+        ])),
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(cwd.to_string()).style(Style::default().fg(Color::White)),
+        Paragraph::new("branch")
+            .style(if focus == WtFormField::Branch { label_active } else { label_dim }),
         chunks[1],
     );
-    // Verify-by-eye that the args row is actually being drawn: leave a mini
-    // status crumb on the args label that shows the current arg-string length.
-    // (Useful for diagnosing "I typed but I see nothing"; can be removed once
-    // confirmed working.)
-    let args_crumb = format!("  ({} chars)", args.chars().count());
-    let crumb_w = args_crumb.chars().count() as u16;
-    let crumb_x = chunks[3].x + chunks[3].width.saturating_sub(crumb_w);
     f.render_widget(
-        Paragraph::new(args_crumb).style(Style::default().fg(Color::DarkGray)),
-        Rect::new(crumb_x, chunks[3].y, crumb_w, 1),
+        Paragraph::new(branch.to_string()).style(Style::default().fg(theme.title)),
+        chunks[2],
     );
-
     f.render_widget(
-        Paragraph::new(flags_label)
-            .style(if focus == FormField::Args { label_active } else { label_dim }),
+        Paragraph::new("worktree path")
+            .style(if focus == WtFormField::Path { label_active } else { label_dim }),
         chunks[3],
     );
-
-    // Always render the args text — no conditional placeholder. Putting a
-    // visible "▎ " gutter at the start of the row makes the field obvious
-    // even when empty, and `replace_all` ratatui's Buffer with a fresh
-    // styled Paragraph means there's no stale-cell bleed-through from a
-    // prior frame's placeholder string.
-    let args_display = if args.is_empty() {
-        if focus == FormField::Args {
-            String::new() // cursor-only; the bar marker still shows below
-        } else {
-            "(empty — claude runs with default flags)".to_string()
-        }
-    } else {
-        args.to_string()
-    };
-    let args_style = if args.is_empty() && focus != FormField::Args {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
-    } else {
-        Style::default().fg(Color::White)
-    };
     f.render_widget(
-        Paragraph::new(args_display).style(args_style),
+        Paragraph::new(path.to_string()).style(Style::default().fg(theme.title)),
         chunks[4],
-    );
-    f.render_widget(
-        Paragraph::new("e.g.  --dangerously-skip-permissions   --system-prompt \"…\"   --effort xhigh   --add-dir <path>")
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[5],
     );
 
     match focus {
-        FormField::Cwd => {
+        WtFormField::Branch => {
             f.set_cursor_position(Position::new(
-                chunks[1].x + cwd_cursor as u16,
-                chunks[1].y,
+                chunks[2].x + branch_cursor as u16,
+                chunks[2].y,
             ));
         }
-        FormField::Args => {
+        WtFormField::Path => {
             f.set_cursor_position(Position::new(
-                chunks[4].x + args_cursor as u16,
+                chunks[4].x + path_cursor as u16,
                 chunks[4].y,
             ));
         }
     }
 
     f.render_widget(
-        Paragraph::new("─".repeat(chunks[6].width as usize))
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(
+            "tip: git auth (gh, ssh keys, etc.) needs to be set up if claude will push or fetch from this worktree",
+        )
+        .style(Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)),
         chunks[6],
     );
+
     f.render_widget(
-        Paragraph::new("recent directories").style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(" enter create   ·   tab switch field   ·   esc back to spawn form")
+            .style(Style::default().fg(theme.dim)),
         chunks[7],
     );
 
-    for (i, dir) in recent.iter().take(6).enumerate() {
-        let y = chunks[8].y + i as u16;
-        if y >= chunks[8].y + chunks[8].height {
-            break;
-        }
-        let marker = if i == recent_selected && focus == FormField::Cwd {
-            "› "
-        } else {
-            "  "
-        };
-        let style = if i == recent_selected && focus == FormField::Cwd {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let avail = chunks[8].width.saturating_sub(2) as usize;
-        let line = format!("{marker}{}", truncate_ellipsis(&shorten_home(dir), avail));
+    if let (Some(i), Some(msg)) = (idx_error, error) {
         f.render_widget(
-            Paragraph::new(line).style(style),
-            Rect::new(chunks[8].x, y, chunks[8].width, 1),
+            Paragraph::new(format!(" ✗ {msg}"))
+                .style(Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)),
+            chunks[i],
         );
     }
-
-    f.render_widget(
-        Paragraph::new(" enter create   ·   tab switch field   ·   ↑/↓ recent (cwd field)   ·   esc cancel")
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[9],
-    );
 }
 
 fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
@@ -1372,20 +2233,36 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
 
-    // Title row: theme-accent "claws" + dim count + right-aligned cwd hint
+    // Title row: theme-accent "claws" + dim count on the left,
+    // right-aligned state counts (e.g. "3●  1◐  1★") in theme status colors.
     let count_part = format!(
         "{} session{}",
         app.sessions.len(),
         if app.sessions.len() == 1 { "" } else { "s" }
     );
-    let cwd_hint = app
-        .sessions
-        .get(app.selected)
-        .map(|s| s.cwd.as_str())
-        .unwrap_or("");
     let title_w = chunks[0].width as usize;
     use ratatui::text::{Line, Span};
-    let mut spans = vec![
+
+    // Aggregate per-status counts.
+    let mut idle_n = 0u32;
+    let mut working_n = 0u32;
+    let mut awaiting_n = 0u32;
+    let mut spawning_n = 0u32;
+    let mut exited_n = 0u32;
+    let mut failed_n = 0u32;
+    for s in &app.sessions {
+        match s.status.as_str() {
+            "idle" => idle_n += 1,
+            "streaming" => working_n += 1,
+            "awaiting_permission" => awaiting_n += 1,
+            "spawning" => spawning_n += 1,
+            "exited" => exited_n += 1,
+            "resume_failed" => failed_n += 1,
+            _ => {}
+        }
+    }
+
+    let mut left_spans = vec![
         Span::styled(
             " claws ",
             Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -1393,18 +2270,48 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         Span::styled(" · ", Style::default().fg(theme.dim)),
         Span::styled(count_part.clone(), Style::default().fg(theme.body)),
     ];
-    if !cwd_hint.is_empty() {
-        let used = " claws ".chars().count() + " · ".chars().count() + count_part.chars().count();
-        let avail = title_w.saturating_sub(used + 2);
-        let cwd_short = truncate_ellipsis(cwd_hint, avail);
-        let pad = title_w
-            .saturating_sub(used + cwd_short.chars().count())
-            .saturating_sub(1);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(format!("{cwd_short} "), Style::default().fg(theme.cwd)));
+
+    // Build right-aligned state-count spans. Each non-zero status emits
+    // "<count><glyph>" in its theme color, separated by 2 spaces.
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    let mut right_text_w: usize = 0;
+    let push_count = |right_spans: &mut Vec<Span<'static>>,
+                      right_text_w: &mut usize,
+                      n: u32,
+                      glyph: &'static str,
+                      color: Color| {
+        if n == 0 {
+            return;
+        }
+        if !right_spans.is_empty() {
+            right_spans.push(Span::styled("  ", Style::default().fg(theme.dim)));
+            *right_text_w += 2;
+        }
+        let txt = format!("{n}{glyph}");
+        *right_text_w += txt.chars().count();
+        right_spans.push(Span::styled(
+            txt,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    };
+    push_count(&mut right_spans, &mut right_text_w, failed_n, "✗", theme.context_high);
+    push_count(&mut right_spans, &mut right_text_w, awaiting_n, "★", theme.awaiting_a);
+    push_count(&mut right_spans, &mut right_text_w, working_n, "◐", theme.working);
+    push_count(&mut right_spans, &mut right_text_w, idle_n, "●", theme.idle);
+    push_count(&mut right_spans, &mut right_text_w, spawning_n, "◌", theme.spawning);
+    push_count(&mut right_spans, &mut right_text_w, exited_n, "○", theme.exited);
+
+    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = title_w
+        .saturating_sub(left_w + right_text_w)
+        .saturating_sub(1);
+    if !right_spans.is_empty() {
+        left_spans.push(Span::raw(" ".repeat(pad)));
+        left_spans.extend(right_spans);
+        left_spans.push(Span::raw(" "));
     }
     f.render_widget(
-        Paragraph::new(Line::from(spans)),
+        Paragraph::new(Line::from(left_spans)),
         Rect::new(chunks[0].x, chunks[0].y, chunks[0].width, 1),
     );
     f.render_widget(
@@ -1417,7 +2324,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         if app.filter.is_some() {
             f.render_widget(
                 Paragraph::new("\n\n  no sessions match the filter\n  press esc to clear")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme.dim)),
                 chunks[1],
             );
         } else {
@@ -1425,10 +2332,16 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         }
     } else {
         let owned: Vec<SessionInfo> = visible.iter().map(|s| (*s).clone()).collect();
-        draw_split(f, &owned, app.selected, app.tick_phase, chunks[1], app.detail_scroll);
-        // Sidebar is single-column for navigation purposes.
+        // Branch on layout mode. Both modes write back grid_cols so the
+        // navigation arithmetic (move_left/right/up/down) lines up.
+        let cols_used = if app.grid_mode {
+            draw_grid(f, &owned, app.selected, app.tick_phase, chunks[1], &app.last_status)
+        } else {
+            draw_split(f, &owned, app.selected, app.tick_phase, chunks[1], app.detail_scroll, &app.last_status, &app.session_branches);
+            1
+        };
         let app_ptr = app as *const App as *mut App;
-        unsafe { (*app_ptr).grid_cols = 1; }
+        unsafe { (*app_ptr).grid_cols = cols_used; }
     }
 
     // Footer separator + help/status line
@@ -1437,18 +2350,52 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new("─".repeat(footer_w)).style(Style::default().fg(theme.dim)),
         Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
     );
-    let status_text = if let Some(filter) = app.filter.as_deref() {
-        format!(" / {filter}_  (esc clear · enter exit input)")
+    if let Some(filter) = app.filter.as_deref() {
+        let txt = format!(" / {filter}_  (esc clear · enter exit input)");
+        f.render_widget(
+            Paragraph::new(txt).style(Style::default().fg(theme.dim)),
+            Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
+        );
     } else if let Some((msg, _)) = &app.status_message {
-        format!(" {msg}")
+        f.render_widget(
+            Paragraph::new(format!(" {msg}")).style(Style::default().fg(theme.dim)),
+            Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
+        );
     } else {
-        " hjkl  move    enter  attach    c  new    r  rename    R  restart    x  close    /  filter    i  info    t  theme    ?  help    q  quit"
-            .to_string()
-    };
-    f.render_widget(
-        Paragraph::new(status_text).style(Style::default().fg(theme.dim)),
-        Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
-    );
+        // Trimmed key/desc strip with the keys lit up in theme.accent.
+        let key_style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+        let desc_style = Style::default().fg(theme.dim);
+        let pair = |k: &'static str, v: &'static str| -> [Span<'static>; 3] {
+            [
+                Span::styled(k.to_string(), key_style),
+                Span::raw(" "),
+                Span::styled(v.to_string(), desc_style),
+            ]
+        };
+        let gap = || Span::styled("    ", desc_style);
+        // Show what `g` toggles to next, and which theme is active right now —
+        // both bits of state the user can otherwise only learn by trying.
+        let layout_label = if app.grid_mode { "sidebar" } else { "grid" };
+        let theme_label = theme.label;
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        spans.extend(pair("enter", "attach"));
+        spans.push(gap());
+        spans.extend(pair("c", "new"));
+        spans.push(gap());
+        spans.extend(pair("g", layout_label));
+        spans.push(gap());
+        spans.extend(pair("/", "filter"));
+        spans.push(gap());
+        spans.extend(pair("t", theme_label));
+        spans.push(gap());
+        spans.extend(pair("?", "help"));
+        spans.push(gap());
+        spans.extend(pair("q", "quit"));
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
+        );
+    }
 }
 
 fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
@@ -1533,11 +2480,13 @@ fn draw_split(
     tick_phase: u32,
     area: Rect,
     detail_scroll: u16,
+    last_status: &std::collections::HashMap<Uuid, (String, SystemTime)>,
+    branch_lookup: &std::collections::HashMap<Uuid, Option<String>>,
 ) {
     let theme = crate::theme::current();
     if area.width < SIDEBAR_W + 30 {
         // Terminal too narrow for split — fall back to a stacked single column.
-        draw_sidebar(f, sessions, selected, tick_phase, area);
+        draw_sidebar(f, sessions, selected, tick_phase, area, last_status);
         return;
     }
     let chunks = Layout::default()
@@ -1549,7 +2498,7 @@ fn draw_split(
         ])
         .split(area);
 
-    draw_sidebar(f, sessions, selected, tick_phase, chunks[0]);
+    draw_sidebar(f, sessions, selected, tick_phase, chunks[0], last_status);
     // Vertical separator in theme color
     for y in chunks[1].y..chunks[1].y + chunks[1].height {
         f.render_widget(
@@ -1558,7 +2507,7 @@ fn draw_split(
         );
     }
     if let Some(s) = sessions.get(selected) {
-        draw_detail(f, s, tick_phase, chunks[2], detail_scroll);
+        draw_detail(f, s, tick_phase, chunks[2], detail_scroll, branch_lookup);
     }
 }
 
@@ -1568,6 +2517,7 @@ fn draw_sidebar(
     selected: usize,
     tick_phase: u32,
     area: Rect,
+    last_status: &std::collections::HashMap<Uuid, (String, SystemTime)>,
 ) {
     let stride = SIDEBAR_ROW_H;
     let max_visible = ((area.height + 1) / stride) as usize;
@@ -1582,12 +2532,18 @@ fn draw_sidebar(
         if y + 2 > area.y + area.height {
             break;
         }
+        let flash_ms = last_status
+            .get(&s.id)
+            .and_then(|(_, t)| t.elapsed().ok())
+            .map(|d| d.as_millis())
+            .filter(|&ms| ms <= 500);
         draw_sidebar_entry(
             f,
             s,
             idx == selected,
             tick_phase,
             Rect::new(area.x, y, area.width, 2),
+            flash_ms,
         );
     }
 }
@@ -1598,13 +2554,31 @@ fn draw_sidebar_entry(
     selected: bool,
     tick_phase: u32,
     area: Rect,
+    flash_ms: Option<u128>,
 ) {
     let theme = crate::theme::current();
     let color = status_color_pulsed(&s.status, tick_phase);
     let glyph = status_glyph(&s.status, tick_phase);
+    let awaiting = s.status == "awaiting_permission";
+    // Brief flash on state transition: same subtle bg tint as awaiting,
+    // for ~500ms after the daemon reports the change.
+    let flashing = flash_ms.is_some();
+    let tint = awaiting || flashing;
 
-    // Selected entry gets a 1-col theme-accent gutter on the left + subtle bg
-    // tint across the whole row. Much more visible than the previous ▎ marker.
+    // Awaiting-permission rows get a row-wide subtle bg tint so they're
+    // visible from across the room. Painted before any other row content
+    // so subsequent renders stack on top with their own styles intact.
+    if tint {
+        for r in 0..2u16 {
+            f.render_widget(
+                Paragraph::new(" ".repeat(area.width as usize))
+                    .style(Style::default().bg(theme.awaiting_bg)),
+                Rect::new(area.x, area.y + r, area.width, 1),
+            );
+        }
+    }
+
+    // Selected entry: 1-col theme-accent gutter on the left across both rows.
     if selected {
         for r in 0..2u16 {
             f.render_widget(
@@ -1618,41 +2592,201 @@ fn draw_sidebar_entry(
         Some(t) if !t.is_empty() => (t.to_string(), true),
         _ => (s.name.clone(), false),
     };
-    let title_style = if title_is_auto {
+    let mut title_style = if title_is_auto {
         Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.title_fallback).add_modifier(Modifier::ITALIC)
     };
+    if selected {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    if tint {
+        title_style = title_style.bg(theme.awaiting_bg);
+    }
 
     use ratatui::text::{Line, Span};
 
-    // Row 1: glyph + title
-    let title_avail = area.width.saturating_sub(4) as usize;
+    let dangerous = s.extra_args.iter().any(|a| a == DANGEROUS_FLAG);
+
+    // Row 1: glyph + title (+ "!" suffix if spawned with --dangerously-skip-permissions)
+    let danger_w = if dangerous { 2usize } else { 0 };
+    let title_avail = area.width.saturating_sub(4 + danger_w as u16) as usize;
     let title_truncated = truncate_ellipsis(&title, title_avail);
-    let title_line = Line::from(vec![
-        Span::raw("  "),
-        Span::styled(format!("{glyph} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    let mut glyph_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    if tint {
+        glyph_style = glyph_style.bg(theme.awaiting_bg);
+    }
+    let row_pad_style = if tint {
+        Style::default().bg(theme.awaiting_bg)
+    } else {
+        Style::default()
+    };
+    let mut danger_style = Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD);
+    if tint {
+        danger_style = danger_style.bg(theme.awaiting_bg);
+    }
+    let mut title_spans = vec![
+        Span::styled("  ", row_pad_style),
+        Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(title_truncated, title_style),
-    ]);
+    ];
+    if dangerous {
+        title_spans.push(Span::styled(" !", danger_style));
+    }
+    let title_line = Line::from(title_spans);
     f.render_widget(
         Paragraph::new(title_line),
         Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
     );
 
-    // Row 2 (indented): status · time-ago
+    // Row 2: indented status · time-ago, with cwd basename right-aligned.
     let status_label = display_status(&s.status);
     let time_ago = format_time_ago(s.last_activity_ms);
     let exit_part = s.exit_code.map(|c| format!(" · exit {c}")).unwrap_or_default();
+    let basename = cwd_basename(&s.cwd);
+    let left_text = format!("    {status_label} · {time_ago}{exit_part}");
+    let inner_w = area.width.saturating_sub(1) as usize;
+    let right_w = basename.chars().count();
+    let pad = inner_w
+        .saturating_sub(left_text.chars().count())
+        .saturating_sub(right_w)
+        .saturating_sub(1);
+    let pad_str = " ".repeat(pad);
+
+    let mut status_style = Style::default().fg(color);
+    let mut dim_style = Style::default().fg(theme.dim);
+    let mut cwd_style = Style::default().fg(theme.cwd);
+    if tint {
+        status_style = status_style.bg(theme.awaiting_bg);
+        dim_style = dim_style.bg(theme.awaiting_bg);
+        cwd_style = cwd_style.bg(theme.awaiting_bg);
+    }
+
     let meta_line = Line::from(vec![
-        Span::raw("    "),
-        Span::styled(status_label, Style::default().fg(color)),
-        Span::styled(format!(" · {time_ago}"), Style::default().fg(theme.dim)),
-        Span::styled(exit_part, Style::default().fg(theme.dim)),
+        Span::styled("    ", row_pad_style),
+        Span::styled(status_label.to_string(), status_style),
+        Span::styled(format!(" · {time_ago}"), dim_style),
+        Span::styled(exit_part, dim_style),
+        Span::styled(pad_str, row_pad_style),
+        Span::styled(basename, cwd_style),
+        Span::styled(" ", row_pad_style),
     ]);
     f.render_widget(
         Paragraph::new(meta_line),
         Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(1), 1),
     );
+}
+
+fn cwd_basename(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// Compare two cwd strings as filesystem paths. Tries canonicalize first
+/// (handles symlinks + case-insensitive Windows drives) and falls back to
+/// raw Path equality if canonicalize fails.
+fn paths_equal(a: &str, b: &str) -> bool {
+    let pa = std::path::Path::new(a);
+    let pb = std::path::Path::new(b);
+    let ca = std::fs::canonicalize(pa).ok();
+    let cb = std::fs::canonicalize(pb).ok();
+    match (ca, cb) {
+        (Some(x), Some(y)) => x == y,
+        _ => pa == pb,
+    }
+}
+
+/// Recompute the worktree-aware fields on the spawn-form modal whenever
+/// the user edits the cwd field. Cheap (~20ms total: two git invocations
+/// plus a read_dir for completion) and only runs on actual change, gated
+/// by `last_scan_cwd`.
+fn rescan_spawn_form(app: &mut App) {
+    let sessions = app.sessions.clone();
+    if let Some(Modal::SpawnForm {
+        cwd,
+        repo_root,
+        worktrees,
+        collision,
+        last_scan_cwd,
+        wt_selected,
+        cwd_completion,
+        ..
+    }) = app.modal.as_mut()
+    {
+        if *cwd == *last_scan_cwd {
+            return;
+        }
+        *last_scan_cwd = cwd.clone();
+        let cwd_path = std::path::Path::new(cwd);
+        *repo_root = if cwd_path.is_dir() {
+            crate::git::find_repo_root(cwd_path)
+        } else {
+            None
+        };
+        *worktrees = match repo_root.as_deref() {
+            Some(r) => crate::git::list_worktrees(r),
+            None => Vec::new(),
+        };
+        *collision = sessions.iter().any(|s| paths_equal(&s.cwd, cwd));
+        *wt_selected = 0;
+        *cwd_completion = complete_path(cwd);
+    }
+}
+
+/// Filesystem path completion: given a typed-so-far path, return the
+/// suffix that would make it match a real subdirectory in the parent.
+/// Picks the lexicographically first matching directory when there are
+/// several. Returns None if the typed path is already complete (the
+/// final component is an exact match) or no candidate exists.
+fn complete_path(typed: &str) -> Option<String> {
+    if typed.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(typed);
+    let ends_with_sep = typed.ends_with('/') || typed.ends_with('\\');
+    let (dir, prefix) = if ends_with_sep {
+        (path.to_path_buf(), String::new())
+    } else {
+        let parent = path.parent()?.to_path_buf();
+        let name = path.file_name().and_then(|s| s.to_str())?;
+        (parent, name.to_string())
+    };
+    if !dir.is_dir() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut matches: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_str()?.to_string();
+            // Prefix match (case-sensitive on Unix; case-insensitive on
+            // Windows where filesystem is itself case-insensitive).
+            #[cfg(unix)]
+            let hit = n.starts_with(&prefix);
+            #[cfg(windows)]
+            let hit = n.to_lowercase().starts_with(&prefix.to_lowercase());
+            if hit && e.path().is_dir() {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    let first = matches.into_iter().next()?;
+    // Compare in a way that matches our case sensitivity above.
+    #[cfg(unix)]
+    let exact = first == prefix;
+    #[cfg(windows)]
+    let exact = first.to_lowercase() == prefix.to_lowercase();
+    if exact {
+        return None;
+    }
+    Some(first[prefix.len()..].to_string())
 }
 
 fn draw_detail(
@@ -1661,7 +2795,9 @@ fn draw_detail(
     tick_phase: u32,
     area: Rect,
     detail_scroll: u16,
+    branch_lookup: &std::collections::HashMap<Uuid, Option<String>>,
 ) {
+    let theme = crate::theme::current();
     let color = status_color_pulsed(&s.status, tick_phase);
     let glyph = status_glyph(&s.status, tick_phase);
     let (title, title_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
@@ -1669,9 +2805,9 @@ fn draw_detail(
         _ => (s.name.clone(), false),
     };
     let title_style = if title_is_auto {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+        Style::default().fg(theme.title_fallback).add_modifier(Modifier::ITALIC)
     };
 
     use ratatui::text::{Line, Span};
@@ -1683,33 +2819,32 @@ fn draw_detail(
         area.height,
     );
 
-    // Header: glyph  title  ·  status  ·  uptime  ·  time-ago  ·  model
+    // Header: glyph  title  ·  status  ·  uptime  ·  time-ago    (model lives in info section now)
     let status_label = display_status(&s.status);
     let uptime = format_uptime(s.started_at_ms);
     let time_ago = format_time_ago(s.last_activity_ms);
-    let model = s.model.as_deref().map(short_model).unwrap_or("—");
     let header_line = Line::from(vec![
         Span::styled(format!("{glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(title, title_style),
-        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  ·  ", Style::default().fg(theme.dim)),
         Span::styled(status_label, Style::default().fg(color)),
-        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("  ·  {model}"), Style::default().fg(Color::Magenta)),
+        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(theme.dim)),
+        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(theme.dim)),
     ]);
     f.render_widget(Paragraph::new(header_line), Rect::new(pad.x, pad.y, pad.width, 1));
 
     // Separator
     f.render_widget(
         Paragraph::new("─".repeat(pad.width as usize))
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(theme.dim)),
         Rect::new(pad.x, pad.y + 1, pad.width, 1),
     );
 
     let cost = s.model.as_deref().map(|m| estimate_cost(m, s)).unwrap_or(0.0);
     let cwd = shorten_path_left(&shorten_home(&s.cwd), pad.width.saturating_sub(12) as usize);
-    let label = Style::default().fg(Color::DarkGray);
-    let val = Style::default().fg(Color::White);
+    let model = s.model.as_deref().map(short_model).unwrap_or("—").to_string();
+    let label = Style::default().fg(theme.dim);
+    let val = Style::default().fg(theme.body);
     let row = |k: &'static str, v: String, vstyle: Style| -> Line<'static> {
         Line::from(vec![
             Span::styled(format!("{:<10}", k), label),
@@ -1718,45 +2853,33 @@ fn draw_detail(
     };
 
     let mut info_lines: Vec<Line> = Vec::new();
-    info_lines.push(row("cwd", cwd, Style::default().fg(Color::Blue)));
+    info_lines.push(row("cwd", cwd, Style::default().fg(theme.cwd)));
+    if let Some(Some(branch)) = branch_lookup.get(&s.id) {
+        info_lines.push(row(
+            "branch",
+            branch.clone(),
+            Style::default().fg(theme.idle).add_modifier(Modifier::BOLD),
+        ));
+    }
+    info_lines.push(row("model", model, Style::default().fg(theme.model)));
     info_lines.push(row("turns", s.turn_count.to_string(), val));
     if let Some(t) = &s.current_tool {
         info_lines.push(row(
             "tool",
             format!("⚙ {}", truncate_ellipsis(t, pad.width.saturating_sub(14) as usize)),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.tool),
         ));
     }
-    if let Some(pct) = s.context_pct {
-        let bar = context_bar(pct, 20);
-        let used = s.context_used.as_deref().unwrap_or("?");
-        let total = s.context_total.as_deref().unwrap_or("?");
-        let bar_color = match pct {
-            0..=59 => Color::Green,
-            60..=84 => Color::Yellow,
-            _ => Color::Red,
+    if !s.extra_args.is_empty() {
+        let joined = s.extra_args.join(" ");
+        let dangerous = s.extra_args.iter().any(|a| a == DANGEROUS_FLAG);
+        let truncated = truncate_ellipsis(&joined, pad.width.saturating_sub(12) as usize);
+        let style = if dangerous {
+            Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.body)
         };
-        info_lines.push(Line::from(vec![
-            Span::styled(format!("{:<10}", "context"), label),
-            Span::styled(bar, Style::default().fg(bar_color)),
-            Span::styled(
-                format!("  {pct}%  ·  {used}/{total}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    } else if matches!(s.status.as_str(), "idle" | "streaming" | "awaiting_permission") {
-        // Reaches here only when BOTH paths failed: status-bar scrape didn't
-        // match and we don't have token usage to compute from. Most often
-        // this is a fresh session before its first response.
-        info_lines.push(Line::from(vec![
-            Span::styled(format!("{:<10}", "context"), label),
-            Span::styled(
-                "(appears after first response)",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
+        info_lines.push(row("flags", truncated, style));
     }
     let info_h = info_lines.len() as u16;
     f.render_widget(
@@ -1764,9 +2887,12 @@ fn draw_detail(
         Rect::new(pad.x, pad.y + 3, pad.width, info_h),
     );
 
-    // Last message section
+    // Last message section. Reserve bottom 2 rows for stats strip (1 row strip + 1 gap).
     let msg_y = pad.y + 3 + info_h + 1;
-    if msg_y < pad.y + pad.height {
+    let bottom = pad.y + pad.height;
+    let strip_h: u16 = 1;
+    let strip_top = bottom.saturating_sub(strip_h);
+    if msg_y < strip_top {
         f.render_widget(
             Paragraph::new("last message").style(label),
             Rect::new(pad.x, msg_y, pad.width, 1),
@@ -1776,47 +2902,105 @@ fn draw_detail(
             _ => "(no messages yet)".to_string(),
         };
         let msg_style = if s.last_message.is_some() {
-            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+            Style::default().fg(theme.body).add_modifier(Modifier::ITALIC)
         } else {
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+            Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)
         };
-        // Use all rows between the label and the bottom-anchored stats line,
-        // minus one for a visual breathing gap. The stats render after this so
-        // any wrap-overflow into the last row is overwritten cleanly.
         let msg_top = msg_y + 1;
-        let bottom = pad.y + pad.height;
-        let msg_h = bottom.saturating_sub(msg_top + 2).max(1);
-        if msg_top < bottom {
+        // Keep one blank row between the message and the stats strip.
+        let msg_h = strip_top.saturating_sub(msg_top + 1).max(1);
+        if msg_top < strip_top {
+            // Quoted-block treatment: a left bar in theme.dim, message indented past it.
+            // Bar runs only as many rows as the wrapped text actually fills,
+            // not the whole message slot — otherwise short messages get a
+            // tall floating column of ▎ next to nothing.
+            let content_w = pad.width.saturating_sub(1).max(1) as usize;
+            let mut text_rows = 0u16;
+            for line in msg_text.split('\n') {
+                let len = line.chars().count();
+                let rows = ((len + content_w - 1) / content_w).max(1) as u16;
+                text_rows = text_rows.saturating_add(rows);
+                if text_rows >= msg_h {
+                    break;
+                }
+            }
+            let bar_rows = text_rows.min(msg_h).max(1);
+            for r in 0..bar_rows {
+                f.render_widget(
+                    Paragraph::new("▎").style(Style::default().fg(theme.dim)),
+                    Rect::new(pad.x, msg_top + r, 1, 1),
+                );
+            }
             f.render_widget(
-                Paragraph::new(format!("  {msg_text}"))
+                Paragraph::new(format!(" {msg_text}"))
                     .style(msg_style)
                     .wrap(Wrap { trim: false })
                     .scroll((detail_scroll, 0)),
-                Rect::new(pad.x, msg_top, pad.width, msg_h),
+                Rect::new(pad.x + 1, msg_top, pad.width.saturating_sub(1), msg_h),
             );
         }
     }
 
-    // Stats — anchor to bottom of detail pane
-    let stats_line = Line::from(vec![
-        Span::styled(
-            format!("{} → {}", compact_num(s.tokens_input), compact_num(s.tokens_output)),
-            Style::default().fg(Color::Gray),
-        ),
-        Span::styled(
-            format!("  ·  cache {}", compact_num(s.tokens_cache_read)),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("  ·  {}", format_cost(cost)),
-            Style::default().fg(Color::Green),
-        ),
-    ]);
+    // Bottom stats strip: tokens │ context │ cost
     if pad.height >= 2 {
-        let stats_y = pad.y + pad.height - 1;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let sep = || Span::styled("  │  ", Style::default().fg(theme.dim));
+        let bold = Modifier::BOLD;
+
+        // Block 1: tokens
+        spans.push(Span::styled(
+            format!("{}", compact_num(s.tokens_input)),
+            Style::default().fg(theme.body).add_modifier(bold),
+        ));
+        spans.push(Span::styled(" → ", Style::default().fg(theme.dim)));
+        spans.push(Span::styled(
+            format!("{}", compact_num(s.tokens_output)),
+            Style::default().fg(theme.body).add_modifier(bold),
+        ));
+        if s.tokens_cache_read > 0 {
+            spans.push(Span::styled(
+                format!("  cache {}", compact_num(s.tokens_cache_read)),
+                Style::default().fg(theme.dim),
+            ));
+        }
+
+        // Block 2: context
+        spans.push(sep());
+        if let Some(pct) = s.context_pct {
+            let bar = context_bar(pct, 12);
+            let used = s.context_used.as_deref().unwrap_or("?");
+            let total = s.context_total.as_deref().unwrap_or("?");
+            let bar_color = match pct {
+                0..=59 => theme.context_low,
+                60..=84 => theme.context_mid,
+                _ => theme.context_high,
+            };
+            spans.push(Span::styled(bar, Style::default().fg(bar_color)));
+            spans.push(Span::styled(
+                format!("  {pct}%"),
+                Style::default().fg(theme.body).add_modifier(bold),
+            ));
+            spans.push(Span::styled(
+                format!("  ·  {used}/{total}"),
+                Style::default().fg(theme.dim),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "ctx —",
+                Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+            ));
+        }
+
+        // Block 3: cost
+        spans.push(sep());
+        spans.push(Span::styled(
+            format_cost(cost),
+            Style::default().fg(theme.cost).add_modifier(bold),
+        ));
+
         f.render_widget(
-            Paragraph::new(stats_line),
-            Rect::new(pad.x, stats_y, pad.width, 1),
+            Paragraph::new(Line::from(spans)),
+            Rect::new(pad.x, strip_top, pad.width, 1),
         );
     }
 }
@@ -1832,13 +3016,17 @@ fn status_color_pulsed(status: &str, tick_phase: u32) -> Color {
         "idle" => t.idle,
         "streaming" => t.working,
         "awaiting_permission" => {
-            if (tick_phase / 5) % 2 == 0 {
+            // Fast 2-tick pulse so "needs you" sessions are unmissable.
+            if (tick_phase / 2) % 2 == 0 {
                 t.awaiting_a
             } else {
                 t.awaiting_b
             }
         }
         "exited" => t.exited,
+        // Resume failure surfaces in the same palette as the high-context
+        // warning — these need attention.
+        "resume_failed" => t.context_high,
         _ => t.title,
     }
 }
@@ -1851,8 +3039,17 @@ fn status_glyph(status: &str, tick_phase: u32) -> &'static str {
             const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
             FRAMES[((tick_phase / 3) % 4) as usize]
         }
-        "awaiting_permission" => "★",
+        "awaiting_permission" => {
+            // Cycle the glyph itself in lock-step with the color pulse — even
+            // if the user can't see colors well, the shape change is obvious.
+            if (tick_phase / 2) % 2 == 0 {
+                "★"
+            } else {
+                "✦"
+            }
+        }
         "exited" => "○",
+        "resume_failed" => "✗",
         _ => "?",
     }
 }
@@ -1863,13 +3060,18 @@ fn draw_card(
     selected: bool,
     tick_phase: u32,
     area: Rect,
+    flashing: bool,
 ) {
+    let theme = crate::theme::current();
     let color = status_color_pulsed(&s.status, tick_phase);
-    let border_type = if selected { BorderType::Double } else { BorderType::Plain };
+    let awaiting = (s.status == "awaiting_permission") || flashing;
+    let border_type = if selected { BorderType::Double } else { BorderType::Rounded };
     let border_style = if selected {
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+    } else if awaiting {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(color)
+        Style::default().fg(theme.dim)
     };
 
     let glyph = status_glyph(&s.status, tick_phase);
@@ -1878,30 +3080,35 @@ fn draw_card(
         _ => (s.name.clone(), false),
     };
     let title_style = if title_is_auto {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+        Style::default().fg(theme.title_fallback).add_modifier(Modifier::ITALIC)
     };
 
     use ratatui::text::{Line, Span};
 
     let status_label = display_status(&s.status);
-    let uptime = format_uptime(s.started_at_ms);
     let time_ago = format_time_ago(s.last_activity_ms);
     let model = s.model.as_deref().map(short_model).unwrap_or("—");
 
-    // Title spans the top border. Pack the most important identifying
-    // info in here — name, status, uptime, last-active, model — so the
-    // card body can focus on session content (last message + stats).
-    let title_line = Line::from(vec![
+    // Title spans the top border. Compact: glyph · title · status · time-ago · model (· !)
+    let dangerous = s.extra_args.iter().any(|a| a == DANGEROUS_FLAG);
+    let mut title_spans = vec![
         Span::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(title_label, title_style),
-        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  ·  ", Style::default().fg(theme.dim)),
         Span::styled(status_label, Style::default().fg(color)),
-        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("  ·  {model} "), Style::default().fg(Color::Magenta)),
-    ]);
+        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(theme.dim)),
+        Span::styled(format!("  ·  {model}"), Style::default().fg(theme.model)),
+    ];
+    if dangerous {
+        title_spans.push(Span::styled(
+            "  · !".to_string(),
+            Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD),
+        ));
+    }
+    title_spans.push(Span::raw(" "));
+    let title_line = Line::from(title_spans);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1911,13 +3118,17 @@ fn draw_card(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Inner is 5 rows high (STACKED_CARD_H=7 minus 2 borders). Lay out as:
-    //   row 0: top padding (blank)
-    //   row 1: cwd (blue)
-    //   row 2: last message (italic gray, full-width)
-    //   row 3: stats line (turns / tokens / cost / current_tool / exit)
-    //   row 4: bottom padding (blank)
-    // 2-col left padding inside.
+    // Subtle awaiting bg fill inside the card body — same convention as sidebar.
+    if awaiting {
+        for r in 0..inner.height {
+            f.render_widget(
+                Paragraph::new(" ".repeat(inner.width as usize))
+                    .style(Style::default().bg(theme.awaiting_bg)),
+                Rect::new(inner.x, inner.y + r, inner.width, 1),
+            );
+        }
+    }
+
     let body = Rect::new(
         inner.x + 2,
         inner.y,
@@ -1936,8 +3147,10 @@ fn draw_card(
         .split(body);
 
     let cwd_short = shorten_path_left(&shorten_home(&s.cwd), chunks[1].width as usize);
+    let mut cwd_style = Style::default().fg(theme.cwd);
+    if awaiting { cwd_style = cwd_style.bg(theme.awaiting_bg); }
     f.render_widget(
-        Paragraph::new(cwd_short).style(Style::default().fg(Color::Blue)),
+        Paragraph::new(cwd_short).style(cwd_style),
         chunks[1],
     );
 
@@ -1945,11 +3158,12 @@ fn draw_card(
         Some(m) if !m.is_empty() => truncate_ellipsis(m, chunks[2].width as usize),
         _ => "(no messages yet)".to_string(),
     };
-    let preview_style = if s.last_message.is_some() {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+    let mut preview_style = if s.last_message.is_some() {
+        Style::default().fg(theme.body).add_modifier(Modifier::ITALIC)
     } else {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+        Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)
     };
+    if awaiting { preview_style = preview_style.bg(theme.awaiting_bg); }
     f.render_widget(
         Paragraph::new(preview).style(preview_style),
         chunks[2],
@@ -1962,24 +3176,80 @@ fn draw_card(
         .map(|t| format!("  ·  ⚙ {}", truncate_ellipsis(t, 24)))
         .unwrap_or_default();
     let exit_part = s.exit_code.map(|c| format!("  ·  exit {c}")).unwrap_or_default();
+    let bg = if awaiting { Some(theme.awaiting_bg) } else { None };
+    let style_with_bg = |fg: Color| -> Style {
+        let mut st = Style::default().fg(fg);
+        if let Some(b) = bg { st = st.bg(b); }
+        st
+    };
     let stats_line = Line::from(vec![
-        Span::styled(format!("{}t", s.turn_count), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{}t", s.turn_count), style_with_bg(theme.body)),
         Span::styled(
             format!("  ·  {} → {}", compact_num(s.tokens_input), compact_num(s.tokens_output)),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("  ·  cache {}", compact_num(s.tokens_cache_read)),
-            Style::default().fg(Color::DarkGray),
+            style_with_bg(theme.dim),
         ),
         Span::styled(
             format!("  ·  {}", format_cost(cost)),
-            Style::default().fg(Color::Green),
+            style_with_bg(theme.cost).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(tool_part, Style::default().fg(Color::Cyan)),
-        Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
+        Span::styled(tool_part, style_with_bg(theme.tool)),
+        Span::styled(exit_part, style_with_bg(theme.dim)),
     ]);
     f.render_widget(Paragraph::new(stats_line), chunks[3]);
+}
+
+const CARD_W: u16 = 38;
+const CARD_H: u16 = 7;
+
+fn draw_grid(
+    f: &mut ratatui::Frame,
+    sessions: &[SessionInfo],
+    selected: usize,
+    tick_phase: u32,
+    area: Rect,
+    last_status: &std::collections::HashMap<Uuid, (String, SystemTime)>,
+) -> u16 {
+    let cols = ((area.width + 1) / (CARD_W + 1)).max(1);
+    let row_stride = CARD_H + 1;
+    let visible_rows = (area.height / row_stride).max(1) as usize;
+
+    let selected_row = selected / cols as usize;
+    let scroll_row_off = selected_row.saturating_sub(visible_rows.saturating_sub(1));
+
+    for (idx, s) in sessions.iter().enumerate() {
+        let row = idx / cols as usize;
+        if row < scroll_row_off {
+            continue;
+        }
+        let render_row = (row - scroll_row_off) as u16;
+        if (render_row as usize) >= visible_rows {
+            break;
+        }
+        let col = (idx % cols as usize) as u16;
+        let x = area.x + col * (CARD_W + 1);
+        let y = area.y + render_row * row_stride;
+        let max_w = (area.x + area.width).saturating_sub(x);
+        let card_w = CARD_W.min(max_w);
+        if card_w < 12 || y + CARD_H > area.y + area.height {
+            continue;
+        }
+        let flashing = last_status
+            .get(&s.id)
+            .and_then(|(_, t)| t.elapsed().ok())
+            .map(|d| d.as_millis())
+            .map(|ms| ms <= 500)
+            .unwrap_or(false);
+        draw_card(
+            f,
+            s,
+            idx == selected,
+            tick_phase,
+            Rect::new(x, y, card_w, CARD_H),
+            flashing,
+        );
+    }
+
+    cols
 }
 
 fn shorten_home(path: &str) -> String {
@@ -2074,6 +3344,7 @@ fn display_status(s: &str) -> &'static str {
         "streaming" => "working",
         "awaiting_permission" => "needs you",
         "exited" => "exited",
+        "resume_failed" => "resume failed",
         _ => "?",
     }
 }
@@ -2125,32 +3396,52 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
         _ => return,
     };
 
-    // Header — name, status with color, time-ago, model
+    // Header — glyph, name, status, time-ago, model, ctx %
+    let theme = crate::theme::current();
     let info = app.sessions.iter().find(|s| s.id == session_id);
     use ratatui::text::{Line, Span};
     let header_line = if let Some(s) = info {
         let color = status_color(&s.status);
         let glyph = status_glyph(&s.status, app.tick_phase);
-        let (name, name_is_auto) = match s.ai_title.as_deref() {
+        let (name, name_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
             Some(t) if !t.is_empty() => (t.to_string(), true),
             _ => (s.name.clone(), false),
         };
         let name_style = if name_is_auto {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+            Style::default().fg(theme.title_fallback).add_modifier(Modifier::ITALIC)
         };
         let model = s.model.as_deref().map(short_model).unwrap_or("");
         let time_ago = format_time_ago(s.last_activity_ms);
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::styled(name, name_style),
             Span::styled(format!("  ·  {}", display_status(&s.status)), Style::default().fg(color)),
-            Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::Gray)),
-            Span::styled(format!("  ·  {model}"), Style::default().fg(Color::Magenta)),
-        ])
+            Span::styled(format!("  ·  {time_ago}"), Style::default().fg(theme.dim)),
+            Span::styled(format!("  ·  {model}"), Style::default().fg(theme.model)),
+        ];
+        if let Some(pct) = s.context_pct {
+            let bar_color = match pct {
+                0..=59 => theme.context_low,
+                60..=84 => theme.context_mid,
+                _ => theme.context_high,
+            };
+            spans.push(Span::styled("  ·  ctx ", Style::default().fg(theme.dim)));
+            spans.push(Span::styled(
+                format!("{pct}%"),
+                Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if s.extra_args.iter().any(|a| a == DANGEROUS_FLAG) {
+            spans.push(Span::styled(
+                "  ·  !".to_string(),
+                Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(spans)
     } else {
-        Line::from(Span::styled(format!(" attached — {session_id} "), Style::default().fg(Color::Cyan)))
+        Line::from(Span::styled(format!(" attached — {session_id} "), Style::default().fg(theme.accent)))
     };
     f.render_widget(Paragraph::new(header_line), chunks[0]);
 
@@ -2171,11 +3462,11 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
         " Ctrl-Space  prefix (d=detach n/p=cycle 1-9=jump [=scroll)    keys → claude".to_string()
     };
     let footer_color = if scroll.is_some() {
-        Color::Magenta
+        theme.footer_scroll
     } else if prefix_active {
-        Color::Yellow
+        theme.footer_prefix
     } else {
-        Color::DarkGray
+        theme.dim
     };
     f.render_widget(
         Paragraph::new(footer).style(Style::default().fg(footer_color)),
