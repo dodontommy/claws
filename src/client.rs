@@ -103,6 +103,30 @@ pub async fn close_session_raw(session_id: String) -> Result<()> {
     Ok(())
 }
 
+pub async fn send_input_raw(session_id: uuid::Uuid, data: Vec<u8>) -> Result<()> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    let params = json!({"session_id": session_id.to_string(), "data_b64": b64});
+    let resp = call_with_autospawn("send_input", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    Ok(())
+}
+
+pub async fn read_output_raw(session_id: uuid::Uuid, since: u64) -> Result<(Vec<u8>, u64, String)> {
+    let params = json!({"session_id": session_id.to_string(), "since": since});
+    let resp = call_with_autospawn("read_output", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    let val = resp.result.ok_or_else(|| anyhow!("no result"))?;
+    let data_b64 = val.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64)?;
+    let next_seq = val.get("next_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    Ok((bytes, next_seq, status))
+}
+
 fn print_resp(resp: &Response) {
     match (&resp.result, &resp.error) {
         (Some(v), _) => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
