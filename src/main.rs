@@ -63,6 +63,8 @@ enum Command {
         #[arg(long)]
         event: String,
     },
+    /// Check for and install the latest release.
+    Update,
 }
 
 fn main() -> Result<()> {
@@ -101,8 +103,36 @@ fn main() -> Result<()> {
             Some(Command::Read { session_id, since }) => client::read_output(session_id, since).await,
             Some(Command::Close { session_id }) => client::close_session(session_id).await,
             Some(Command::HookEmit { session, event }) => hook::run_hook_emit(session, event).await,
+            Some(Command::Update) => run_update().await,
         }
     })
+}
+
+async fn run_update() -> Result<()> {
+    use axoupdater::AxoUpdater;
+    let mut updater = AxoUpdater::new_for("claws");
+    if let Err(e) = updater.load_receipt() {
+        anyhow::bail!(
+            "install receipt missing — `claws` was probably installed via `cargo install` \
+             rather than the official installer.\n\n\
+             To enable in-place updates, reinstall via one of:\n  \
+               curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/multi-claude/releases/latest/download/claws-installer.sh | sh\n  \
+               powershell -c \"irm https://github.com/dodontommy/multi-claude/releases/latest/download/claws-installer.ps1 | iex\"\n  \
+               brew install dodontommy/tap/claws\n\n\
+             Underlying error: {e}"
+        );
+    }
+    match updater.run().await {
+        Ok(Some(_)) => {
+            println!("updated claws — relaunch to use the new version.");
+            Ok(())
+        }
+        Ok(None) => {
+            println!("claws is already up to date.");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("update failed: {e}")),
+    }
 }
 
 fn init_tracing(to_stderr: bool) {
