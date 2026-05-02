@@ -87,6 +87,9 @@ struct App {
     filter: Option<String>,
     filter_cursor: usize,
     last_click: Option<(usize, SystemTime)>,
+    /// Vertical scroll offset for the detail pane's last-message paragraph.
+    /// Reset to 0 whenever the selected session changes.
+    detail_scroll: u16,
 }
 
 impl App {
@@ -111,6 +114,14 @@ impl App {
             filter: None,
             filter_cursor: 0,
             last_click: None,
+            detail_scroll: 0,
+        }
+    }
+
+    fn select(&mut self, idx: usize) {
+        if idx != self.selected {
+            self.selected = idx;
+            self.detail_scroll = 0;
         }
     }
 
@@ -154,24 +165,24 @@ impl App {
     fn move_up(&mut self) {
         let cols = self.grid_cols.max(1) as usize;
         if self.selected >= cols {
-            self.selected -= cols;
+            self.select(self.selected - cols);
         }
     }
     fn move_down(&mut self) {
         let cols = self.grid_cols.max(1) as usize;
         let target = self.selected + cols;
         if target < self.visible_count() {
-            self.selected = target;
+            self.select(target);
         }
     }
     fn move_left(&mut self) {
         if self.selected > 0 {
-            self.selected -= 1;
+            self.select(self.selected - 1);
         }
     }
     fn move_right(&mut self) {
         if self.selected + 1 < self.visible_count() {
-            self.selected += 1;
+            self.select(self.selected + 1);
         }
     }
     fn set_status(&mut self, msg: String) {
@@ -331,7 +342,7 @@ async fn handle_mouse(ev: MouseEvent, app: &mut App) {
                 }
                 _ => false,
             };
-            app.selected = idx;
+            app.select(idx);
             app.last_click = Some((idx, now));
             if dbl {
                 attach_at_index(app, idx).await;
@@ -579,6 +590,18 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_up(),
         (KeyCode::Char('h'), _) | (KeyCode::Left, _) => app.move_left(),
         (KeyCode::Char('l'), _) | (KeyCode::Right, _) => app.move_right(),
+        (KeyCode::PageDown, _) => {
+            app.detail_scroll = app.detail_scroll.saturating_add(8);
+        }
+        (KeyCode::PageUp, _) => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(8);
+        }
+        (KeyCode::Char('J'), KeyModifiers::SHIFT) => {
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
+        }
+        (KeyCode::Char('K'), KeyModifiers::SHIFT) => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+        }
         (KeyCode::Char('?'), _) => app.modal = Some(Modal::Help),
         (KeyCode::Char('/'), _) => {
             app.filter = Some(String::new());
@@ -673,7 +696,7 @@ async fn attach_at_index(app: &mut App, idx: usize) {
         read_seq: 0,
         prefix_active: false,
     };
-    app.selected = idx;
+    app.select(idx);
 }
 
 async fn attach_at_offset(app: &mut App, offset: isize) {
@@ -1298,7 +1321,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         }
     } else {
         let owned: Vec<SessionInfo> = visible.iter().map(|s| (*s).clone()).collect();
-        draw_split(f, &owned, app.selected, app.tick_phase, chunks[1]);
+        draw_split(f, &owned, app.selected, app.tick_phase, chunks[1], app.detail_scroll);
         // Sidebar is single-column for navigation purposes.
         let app_ptr = app as *const App as *mut App;
         unsafe { (*app_ptr).grid_cols = 1; }
@@ -1363,6 +1386,7 @@ fn draw_split(
     selected: usize,
     tick_phase: u32,
     area: Rect,
+    detail_scroll: u16,
 ) {
     if area.width < SIDEBAR_W + 30 {
         // Terminal too narrow for split — fall back to a stacked single column.
@@ -1387,7 +1411,7 @@ fn draw_split(
         );
     }
     if let Some(s) = sessions.get(selected) {
-        draw_detail(f, s, tick_phase, chunks[2]);
+        draw_detail(f, s, tick_phase, chunks[2], detail_scroll);
     }
 }
 
@@ -1479,7 +1503,13 @@ fn draw_sidebar_entry(
     );
 }
 
-fn draw_detail(f: &mut ratatui::Frame, s: &SessionInfo, tick_phase: u32, area: Rect) {
+fn draw_detail(
+    f: &mut ratatui::Frame,
+    s: &SessionInfo,
+    tick_phase: u32,
+    area: Rect,
+    detail_scroll: u16,
+) {
     let color = status_color_pulsed(&s.status, tick_phase);
     let glyph = status_glyph(&s.status, tick_phase);
     let (title, title_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
@@ -1562,6 +1592,19 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionInfo, tick_phase: u32, area: R
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+    } else if matches!(s.status.as_str(), "idle" | "streaming" | "awaiting_permission") {
+        // We couldn't find Claude's "<n>% used/total" pattern in any visible
+        // row of the PTY screen. Most likely a custom statusLine that doesn't
+        // expose context. Tell the user how to opt back in.
+        info_lines.push(Line::from(vec![
+            Span::styled(format!("{:<10}", "context"), label),
+            Span::styled(
+                "not detected — claude statusLine needs a `<n>% used/total` token",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
     }
     let info_h = info_lines.len() as u16;
     f.render_widget(
@@ -1595,7 +1638,8 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionInfo, tick_phase: u32, area: R
             f.render_widget(
                 Paragraph::new(format!("  {msg_text}"))
                     .style(msg_style)
-                    .wrap(Wrap { trim: false }),
+                    .wrap(Wrap { trim: false })
+                    .scroll((detail_scroll, 0)),
                 Rect::new(pad.x, msg_top, pad.width, msg_h),
             );
         }
