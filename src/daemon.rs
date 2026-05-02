@@ -433,7 +433,29 @@ async fn handle_hook_event(id: u64, p: HookEventParams, reg: &SessionRegistry) -
 
 fn session_info(s: &Session) -> SessionInfo {
     let snap = s.snapshot();
-    let ctx = s.context_status();
+    let scraped = s.context_status();
+    // Prefer scraped context (always reflects what Claude actually shows).
+    // If the user's statusLine doesn't expose context, fall back to a
+    // computed estimate from the latest assistant message's prompt token
+    // count divided by the model's known context limit.
+    let (context_pct, context_used, context_total) = if let Some(c) = scraped {
+        (Some(c.pct), Some(c.used), Some(c.total))
+    } else if let Some(model) = snap.model.as_deref() {
+        let limit = model_context_limit(model);
+        let used = snap.latest_input_tokens + snap.latest_cache_read_input_tokens;
+        if limit > 0 && used > 0 {
+            let pct = ((used.saturating_mul(100)) / limit).min(100) as u8;
+            (
+                Some(pct),
+                Some(compact_tokens(used)),
+                Some(compact_tokens(limit)),
+            )
+        } else {
+            (None, None, None)
+        }
+    } else {
+        (None, None, None)
+    };
     SessionInfo {
         id: s.id,
         name: s.name.clone(),
@@ -451,9 +473,36 @@ fn session_info(s: &Session) -> SessionInfo {
         tokens_output: snap.tokens_output,
         tokens_cache_read: snap.tokens_cache_read,
         display_override: s.display_override(),
-        context_pct: ctx.as_ref().map(|c| c.pct),
-        context_used: ctx.as_ref().map(|c| c.used.clone()),
-        context_total: ctx.map(|c| c.total),
+        context_pct,
+        context_used,
+        context_total,
+    }
+}
+
+/// Public list-price context window per model family. Best-effort heuristic
+/// for the computed-fallback context bar.
+fn model_context_limit(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
+        1_000_000
+    } else if m.contains("sonnet") {
+        1_000_000
+    } else if m.contains("haiku") {
+        200_000
+    } else {
+        200_000
+    }
+}
+
+fn compact_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 

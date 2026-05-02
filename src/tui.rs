@@ -38,6 +38,13 @@ pub async fn run() -> Result<()> {
     result
 }
 
+struct ScrollState {
+    bytes: Vec<u8>,
+    /// Number of bytes from the start of `bytes` to feed the ephemeral
+    /// parser. `offset == bytes.len()` means "current state" (latest).
+    offset: usize,
+}
+
 enum View {
     Dashboard,
     Attached {
@@ -45,6 +52,7 @@ enum View {
         parser: vt100::Parser,
         read_seq: u64,
         prefix_active: bool,
+        scroll: Option<ScrollState>,
     },
 }
 
@@ -695,6 +703,7 @@ async fn attach_at_index(app: &mut App, idx: usize) {
         parser: vt100::Parser::new(pane_rows, pane_cols, 0),
         read_seq: 0,
         prefix_active: false,
+        scroll: None,
     };
     app.select(idx);
 }
@@ -719,6 +728,17 @@ async fn handle_attached_key(key: KeyEvent, app: &mut App) {
         Some(id) => id,
         None => return,
     };
+
+    // If we're in scroll mode, all keys go to the scroll-mode handler — no
+    // forwarding to the PTY, no prefix interpretation.
+    let in_scroll = matches!(
+        &app.view,
+        View::Attached { scroll: Some(_), .. }
+    );
+    if in_scroll {
+        handle_scroll_key(key, app);
+        return;
+    }
 
     let (prefix_active, take_prefix) = match &mut app.view {
         View::Attached { prefix_active, .. } => (*prefix_active, prefix_active),
@@ -754,13 +774,17 @@ async fn handle_attached_key(key: KeyEvent, app: &mut App) {
                 attach_at_offset(app, -1).await;
                 return;
             }
+            (KeyCode::Char('['), _) => {
+                enter_scroll_mode(app, session_id).await;
+                return;
+            }
             (KeyCode::Char(c), _) if c.is_ascii_digit() && c != '0' => {
                 let idx = (c.to_digit(10).unwrap() as usize) - 1;
                 attach_at_index(app, idx).await;
                 return;
             }
             (KeyCode::Char('?'), _) => {
-                app.set_status("prefix: d=detach n/p=cycle 1-9=jump q=quit".into());
+                app.set_status("prefix: d=detach n/p=cycle 1-9=jump [=scroll q=quit".into());
             }
             (KeyCode::Char(' '), m) if m.contains(KeyModifiers::CONTROL) => {
                 // Literal Ctrl-Space passthrough
@@ -778,6 +802,64 @@ async fn handle_attached_key(key: KeyEvent, app: &mut App) {
     let bytes = encode_key(&key);
     if !bytes.is_empty() {
         let _ = client::send_input_raw(session_id, bytes).await;
+    }
+}
+
+/// Fetch the daemon's full ring buffer for the current session and enter
+/// scroll mode positioned at "latest". User can then back up through
+/// history with arrows / pageup / home.
+async fn enter_scroll_mode(app: &mut App, session_id: Uuid) {
+    let result = client::read_output_raw(session_id, 0).await;
+    match result {
+        Ok((bytes, _next_seq, _status)) => {
+            let offset = bytes.len();
+            if let View::Attached { scroll, .. } = &mut app.view {
+                *scroll = Some(ScrollState { bytes, offset });
+            }
+            app.set_status("scroll mode  ·  ↑↓ jk · pgup/pgdn · g/G top/bottom · esc exit".into());
+        }
+        Err(e) => app.set_status(format!("scroll: fetch failed: {e}")),
+    }
+}
+
+fn handle_scroll_key(key: KeyEvent, app: &mut App) {
+    let scroll = match &mut app.view {
+        View::Attached {
+            scroll: Some(s), ..
+        } => s,
+        _ => return,
+    };
+    // Step sizes are byte-based since we replay the raw stream. ~1920 bytes
+    // is roughly one 24×80 screenful of dense text — close enough for line-
+    // ish scroll feel without parsing newlines out of the byte stream.
+    let line = 1920usize;
+    let page = line * 4;
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
+            if let View::Attached { scroll, .. } = &mut app.view {
+                *scroll = None;
+            }
+            app.set_status("live".into());
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            scroll.offset = scroll.offset.saturating_sub(line);
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            scroll.offset = (scroll.offset + line).min(scroll.bytes.len());
+        }
+        (KeyCode::PageUp, _) => {
+            scroll.offset = scroll.offset.saturating_sub(page);
+        }
+        (KeyCode::PageDown, _) => {
+            scroll.offset = (scroll.offset + page).min(scroll.bytes.len());
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), _) => {
+            scroll.offset = 0;
+        }
+        (KeyCode::End, _) | (KeyCode::Char('G'), _) => {
+            scroll.offset = scroll.bytes.len();
+        }
+        _ => {}
     }
 }
 
@@ -944,8 +1026,17 @@ fn draw_help(f: &mut ratatui::Frame) {
     lines.push(row("Ctrl-Space d", "detach back to dashboard"));
     lines.push(row("Ctrl-Space n / p", "next / previous session"));
     lines.push(row("Ctrl-Space 1-9", "jump to session N"));
+    lines.push(row("Ctrl-Space [", "enter scroll mode  (read history)"));
     lines.push(row("Ctrl-Space q", "quit TUI"));
     lines.push(row("Ctrl-Space Ctrl-Space", "send literal Ctrl-Space to claude"));
+
+    lines.push(Line::from(""));
+    lines.push(sec("scroll mode  (Ctrl-Space [)"));
+    lines.push(row("↑ / ↓  or  j / k", "scroll one screenful"));
+    lines.push(row("PageUp / PageDown", "scroll several screenfuls"));
+    lines.push(row("g / Home", "jump to start of history"));
+    lines.push(row("G / End", "jump back to live"));
+    lines.push(row("esc / q", "exit scroll mode"));
 
     lines.push(Line::from(""));
     lines.push(sec("spawn form  (c)"));
@@ -1593,13 +1684,13 @@ fn draw_detail(
             ),
         ]));
     } else if matches!(s.status.as_str(), "idle" | "streaming" | "awaiting_permission") {
-        // We couldn't find Claude's "<n>% used/total" pattern in any visible
-        // row of the PTY screen. Most likely a custom statusLine that doesn't
-        // expose context. Tell the user how to opt back in.
+        // Reaches here only when BOTH paths failed: status-bar scrape didn't
+        // match and we don't have token usage to compute from. Most often
+        // this is a fresh session before its first response.
         info_lines.push(Line::from(vec![
             Span::styled(format!("{:<10}", "context"), label),
             Span::styled(
-                "not detected — claude statusLine needs a `<n>% used/total` token",
+                "(appears after first response)",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -1962,13 +2053,14 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let (session_id, parser, prefix_active) = match &app.view {
+    let (session_id, parser, prefix_active, scroll) = match &app.view {
         View::Attached {
             session_id,
             parser,
             prefix_active,
+            scroll,
             ..
-        } => (*session_id, parser, *prefix_active),
+        } => (*session_id, parser, *prefix_active, scroll.as_ref()),
         _ => return,
     };
 
@@ -2001,25 +2093,55 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
     };
     f.render_widget(Paragraph::new(header_line), chunks[0]);
 
-    render_pty(f, parser, chunks[1]);
+    render_pty(f, parser, scroll, chunks[1]);
 
-    let footer = if prefix_active {
-        " ◆ prefix:  d  detach    n/p  next/prev    1-9  jump    q  quit    ?  help".to_string()
+    let footer = if let Some(s) = scroll {
+        let pos = if s.bytes.is_empty() {
+            0
+        } else {
+            s.offset.saturating_mul(100) / s.bytes.len()
+        };
+        format!(
+            " ◀ scroll  ·  {pos}%  ·  ↑↓ jk  ·  pgup/pgdn  ·  g/G top/bottom  ·  esc resume live"
+        )
+    } else if prefix_active {
+        " ◆ prefix:  d  detach   n/p  next/prev   1-9  jump   [  scroll   q  quit".to_string()
     } else {
-        " Ctrl-Space  prefix (d=detach n/p=cycle 1-9=jump)    keys → claude".to_string()
+        " Ctrl-Space  prefix (d=detach n/p=cycle 1-9=jump [=scroll)    keys → claude".to_string()
+    };
+    let footer_color = if scroll.is_some() {
+        Color::Magenta
+    } else if prefix_active {
+        Color::Yellow
+    } else {
+        Color::DarkGray
     };
     f.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(if prefix_active {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        })),
+        Paragraph::new(footer).style(Style::default().fg(footer_color)),
         chunks[2],
     );
 }
 
-fn render_pty(f: &mut ratatui::Frame, parser: &vt100::Parser, area: Rect) {
-    let screen = parser.screen();
+fn render_pty(
+    f: &mut ratatui::Frame,
+    parser: &vt100::Parser,
+    scroll: Option<&ScrollState>,
+    area: Rect,
+) {
+    // In scroll mode, build an ephemeral parser fed bytes [0..offset] of the
+    // captured ring buffer and render its screen. Otherwise render the live
+    // parser. The ephemeral binding has to outlive the screen reference.
+    let ephemeral = scroll.map(|s| {
+        let (rows, cols) = parser.screen().size();
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        let end = s.offset.min(s.bytes.len());
+        p.process(&s.bytes[..end]);
+        p
+    });
+    let screen = match &ephemeral {
+        Some(p) => p.screen(),
+        None => parser.screen(),
+    };
     let (rows, cols) = screen.size();
     let buf = f.buffer_mut();
     for r in 0..rows {

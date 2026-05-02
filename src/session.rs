@@ -63,6 +63,8 @@ pub struct SessionSnapshot {
     pub tokens_input: u64,
     pub tokens_output: u64,
     pub tokens_cache_read: u64,
+    pub latest_input_tokens: u64,
+    pub latest_cache_read_input_tokens: u64,
 }
 
 struct SessionRuntime {
@@ -87,6 +89,12 @@ struct SessionRuntime {
     tokens_input: u64,
     tokens_output: u64,
     tokens_cache_read: u64,
+
+    /// Most-recent assistant message's prompt-side token counts. Used to
+    /// estimate context-window fill when Claude's status bar isn't scraped
+    /// (custom statusLine or no rendered status line yet).
+    latest_input_tokens: u64,
+    latest_cache_read_input_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +180,8 @@ pub fn spawn_session(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cache_read: 0,
+        latest_input_tokens: 0,
+        latest_cache_read_input_tokens: 0,
     }));
 
     {
@@ -413,12 +423,14 @@ fn process_jsonl_line(runtime: &Arc<Mutex<SessionRuntime>>, line: &str) {
             if let Some(usage) = msg.and_then(|m| m.get("usage")) {
                 if let Some(t) = usage.get("input_tokens").and_then(|t| t.as_u64()) {
                     s.tokens_input += t;
+                    s.latest_input_tokens = t;
                 }
                 if let Some(t) = usage.get("output_tokens").and_then(|t| t.as_u64()) {
                     s.tokens_output += t;
                 }
                 if let Some(t) = usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()) {
                     s.tokens_cache_read += t;
+                    s.latest_cache_read_input_tokens = t;
                 }
             }
         }
@@ -508,6 +520,8 @@ impl Session {
             tokens_input: s.tokens_input,
             tokens_output: s.tokens_output,
             tokens_cache_read: s.tokens_cache_read,
+            latest_input_tokens: s.latest_input_tokens,
+            latest_cache_read_input_tokens: s.latest_cache_read_input_tokens,
         }
     }
 

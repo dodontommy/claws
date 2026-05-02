@@ -19,11 +19,18 @@ pub fn log_file() -> Result<PathBuf> {
 #[cfg(unix)]
 pub fn socket_name() -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
-    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
-    let p = runtime.join(format!("claws-{user}.sock"));
+    use std::os::unix::fs::PermissionsExt;
+    // Use /tmp/claws-<uid>/sock — same pattern as tmux. /tmp persists across
+    // SSH logouts (until reboot), so resuming a session after logging back in
+    // works reliably. XDG_RUNTIME_DIR (the conventional home for runtime
+    // sockets) is wiped by systemd-logind when the user has zero active
+    // sessions, which would orphan a still-running daemon between SSH
+    // disconnects.
+    let uid = unsafe { libc::getuid() };
+    let dir = PathBuf::from(format!("/tmp/claws-{uid}"));
+    std::fs::create_dir_all(&dir).ok();
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    let p = dir.join("sock");
     Ok(String::from_utf8_lossy(p.as_os_str().as_bytes()).into_owned())
 }
 
