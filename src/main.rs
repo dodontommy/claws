@@ -11,6 +11,7 @@ mod registry;
 mod ring;
 mod session;
 mod spawn;
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "claws", version, about = "TUI multiplexer for Claude Code sessions")]
@@ -74,7 +75,8 @@ fn main() -> Result<()> {
     runtime.block_on(async {
         match cli.command {
             Some(Command::Daemon) => daemon::run().await,
-            Some(Command::Ping) | None => client::ping().await,
+            None => tui::run().await,
+            Some(Command::Ping) => client::ping().await,
             Some(Command::KillServer) => client::kill_server().await,
             Some(Command::Logs) => {
                 println!("{}", paths::log_file()?.display());

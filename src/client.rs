@@ -1,7 +1,7 @@
 use crate::paths;
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, SessionInfo};
 use crate::spawn;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
@@ -68,6 +68,38 @@ pub async fn read_output(session_id: String, since: u64) -> Result<()> {
 pub async fn close_session(session_id: String) -> Result<()> {
     let params = json!({"session_id": session_id});
     print_resp(&call_with_autospawn("close_session", params).await?);
+    Ok(())
+}
+
+// Non-printing variants used by the TUI. They return parsed values instead
+// of pretty-printing to stdout.
+
+pub async fn list_sessions_raw() -> Result<Vec<SessionInfo>> {
+    let resp = call_with_autospawn("list_sessions", json!(null)).await?;
+    let val = resp.result.ok_or_else(|| anyhow!("daemon returned no result"))?;
+    Ok(serde_json::from_value(val)?)
+}
+
+pub async fn create_session_raw(
+    cwd: String,
+    name: Option<String>,
+    model: Option<String>,
+) -> Result<SessionInfo> {
+    let params = json!({"cwd": cwd, "name": name, "model": model});
+    let resp = call_with_autospawn("create_session", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    let val = resp.result.ok_or_else(|| anyhow!("daemon returned no result"))?;
+    Ok(serde_json::from_value(val)?)
+}
+
+pub async fn close_session_raw(session_id: String) -> Result<()> {
+    let params = json!({"session_id": session_id});
+    let resp = call_with_autospawn("close_session", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
     Ok(())
 }
 
