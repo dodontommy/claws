@@ -521,17 +521,33 @@ fn draw_card(
     };
 
     let glyph = status_glyph(&s.status, tick_phase);
-    let display_name = s.ai_title.as_deref().unwrap_or(&s.name);
-    let title_text = format!(" {glyph}  {display_name} ");
+    let (title_label, title_is_auto) = match s.ai_title.as_deref() {
+        Some(t) if !t.is_empty() => (t.to_string(), true),
+        _ => (s.name.clone(), false),
+    };
+    let title_style = if title_is_auto {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // Fallback name (cwd basename) — render dimmer/italic so it's visually
+        // clear we're still waiting for Claude to name the conversation.
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC)
+    };
+    use ratatui::text::{Line as RLine, Span as RSpan};
+    let title_line = RLine::from(vec![
+        RSpan::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        RSpan::styled(title_label, title_style),
+        RSpan::raw(" "),
+    ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(border_type)
         .border_style(border_style)
-        .title(ratatui::text::Span::styled(
-            title_text,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
+        .title(title_line);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -742,12 +758,20 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
     let header_line = if let Some(s) = info {
         let color = status_color(&s.status);
         let glyph = status_glyph(&s.status, app.tick_phase);
-        let name = s.ai_title.as_deref().unwrap_or(&s.name);
+        let (name, name_is_auto) = match s.ai_title.as_deref() {
+            Some(t) if !t.is_empty() => (t.to_string(), true),
+            _ => (s.name.clone(), false),
+        };
+        let name_style = if name_is_auto {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+        };
         let model = s.model.as_deref().map(short_model).unwrap_or("");
         let time_ago = format_time_ago(s.last_activity_ms);
         Line::from(vec![
             Span::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(name, name_style),
             Span::styled(format!("  ·  {}", display_status(&s.status)), Style::default().fg(color)),
             Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::Gray)),
             Span::styled(format!("  ·  {model}"), Style::default().fg(Color::Magenta)),
