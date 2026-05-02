@@ -1870,7 +1870,7 @@ fn display_status(s: &str) -> &'static str {
     match s {
         "spawning" => "spawning",
         "idle" => "idle",
-        "streaming" => "streaming",
+        "streaming" => "working",
         "awaiting_permission" => "needs you",
         "exited" => "exited",
         _ => "?",
