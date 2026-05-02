@@ -455,8 +455,8 @@ fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
     }
 }
 
-const CARD_W: u16 = 40;
-const CARD_H: u16 = 6;
+const CARD_W: u16 = 44;
+const CARD_H: u16 = 7;
 
 fn draw_cards(
     f: &mut ratatui::Frame,
@@ -546,18 +546,31 @@ fn draw_card(
     );
 
     let time_ago = format_time_ago(s.last_activity_ms);
+    let uptime = format_uptime(s.started_at_ms);
     let status_label = display_status(&s.status);
-    let tool_part = s.current_tool.as_deref().map(|t| format!("  ·  {t}")).unwrap_or_default();
+    let tool_part = s
+        .current_tool
+        .as_deref()
+        .map(|t| format!("  ·  {}", truncate_ellipsis(t, 18)))
+        .unwrap_or_default();
     let exit_part = s.exit_code.map(|c| format!("  ·  exit {c}")).unwrap_or_default();
 
     let line1 = Line::from(vec![
         Span::styled(status_label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::Gray)),
+        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(Color::DarkGray)),
         Span::styled(tool_part, Style::default().fg(Color::Cyan)),
         Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let preview_avail = pad.width.saturating_sub(0) as usize;
+    let cwd_avail = pad.width as usize;
+    let cwd_short = shorten_path_left(&shorten_home(&s.cwd), cwd_avail);
+    let line2 = Line::from(Span::styled(
+        cwd_short,
+        Style::default().fg(Color::Blue),
+    ));
+
+    let preview_avail = pad.width as usize;
     let preview = match s.last_message.as_deref() {
         Some(m) if !m.is_empty() => truncate_ellipsis(m, preview_avail),
         _ => "(no messages yet)".to_string(),
@@ -567,9 +580,10 @@ fn draw_card(
     } else {
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
     };
-    let line2 = Line::from(Span::styled(preview, preview_style));
+    let line3 = Line::from(Span::styled(preview, preview_style));
 
     let model = s.model.as_deref().map(short_model).unwrap_or("—");
+    let cost = s.model.as_deref().map(|m| estimate_cost(m, s)).unwrap_or(0.0);
     let toks = format!(
         "{}t  ·  {}→{}  ·  ◷ {}",
         s.turn_count,
@@ -577,13 +591,92 @@ fn draw_card(
         compact_num(s.tokens_output),
         compact_num(s.tokens_cache_read),
     );
-    let line3 = Line::from(vec![
+    let line4 = Line::from(vec![
         Span::styled(model.to_string(), Style::default().fg(Color::Magenta)),
+        Span::styled(format!("  ·  {}", format_cost(cost)), Style::default().fg(Color::Green)),
         Span::styled(format!("  ·  {toks}"), Style::default().fg(Color::DarkGray)),
     ]);
 
-    let p = Paragraph::new(vec![line1, line2, line3]).wrap(Wrap { trim: false });
+    let p = Paragraph::new(vec![line1, line2, line3, line4]).wrap(Wrap { trim: false });
     f.render_widget(p, pad);
+}
+
+fn shorten_home(path: &str) -> String {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if home.is_empty() {
+        return path.to_string();
+    }
+    let path_l = path.to_ascii_lowercase().replace('\\', "/");
+    let home_l = home.to_ascii_lowercase().replace('\\', "/");
+    if path_l.starts_with(&home_l) && path.len() >= home.len() {
+        let rest = &path[home.len()..];
+        return format!("~{rest}");
+    }
+    path.to_string()
+}
+
+fn shorten_path_left(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let take = max - 1;
+    let skipped = chars.len() - take;
+    let mut out = String::with_capacity(max);
+    out.push('…');
+    out.extend(chars.into_iter().skip(skipped));
+    out
+}
+
+fn format_uptime(started_at_ms: u128) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let elapsed_ms = now.saturating_sub(started_at_ms);
+    let s = elapsed_ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// Rough USD estimate from token counts. Pricing per 1M tokens, snapshot
+/// of public list prices — adjust as Anthropic updates.
+fn estimate_cost(model: &str, info: &SessionInfo) -> f64 {
+    let (in_rate, out_rate, cache_rate) = if model.contains("opus") {
+        (15.0, 75.0, 1.50)
+    } else if model.contains("sonnet") {
+        (3.0, 15.0, 0.30)
+    } else if model.contains("haiku") {
+        (0.80, 4.0, 0.08)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    let inp = info.tokens_input as f64;
+    let outp = info.tokens_output as f64;
+    let cache = info.tokens_cache_read as f64;
+    (inp * in_rate + outp * out_rate + cache * cache_rate) / 1_000_000.0
+}
+
+fn format_cost(c: f64) -> String {
+    if c < 0.0005 {
+        "$0.00".to_string()
+    } else if c < 0.01 {
+        format!("${c:.4}")
+    } else if c < 1.0 {
+        format!("${c:.3}")
+    } else {
+        format!("${c:.2}")
+    }
 }
 
 fn display_status(s: &str) -> &'static str {
