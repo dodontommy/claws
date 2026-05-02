@@ -306,13 +306,16 @@ async fn handle_mouse(ev: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => app.move_down(),
         MouseEventKind::Down(MouseButton::Left) => {
             // Body area starts at row 2 (after title + separator).
-            // Stacked layout: cards are full-width, one per row, stride is
-            // STACKED_CARD_H + STACKED_GAP.
+            // Sidebar layout: each session entry is SIDEBAR_ROW_H rows.
+            // Clicks in the sidebar select; clicks in the detail pane do nothing.
             let body_y0 = 2u16;
             if ev.row < body_y0 {
                 return;
             }
-            let row = (ev.row - body_y0) / CARD_H;
+            if ev.column >= SIDEBAR_W {
+                return;
+            }
+            let row = (ev.row - body_y0) / SIDEBAR_ROW_H;
             let idx = row as usize;
             if idx >= app.visible_count() {
                 return;
@@ -1279,9 +1282,10 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         }
     } else {
         let owned: Vec<SessionInfo> = visible.iter().map(|s| (*s).clone()).collect();
-        let cols = draw_cards(f, &owned, app.selected, app.tick_phase, chunks[1]);
+        draw_split(f, &owned, app.selected, app.tick_phase, chunks[1]);
+        // Sidebar is single-column for navigation purposes.
         let app_ptr = app as *const App as *mut App;
-        unsafe { (*app_ptr).grid_cols = cols; }
+        unsafe { (*app_ptr).grid_cols = 1; }
     }
 
     // Footer separator + help/status line
@@ -1333,27 +1337,54 @@ fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
     }
 }
 
-const STACKED_CARD_H: u16 = 7;
-const STACKED_GAP: u16 = 1;
-// Kept around for the mouse hit-test math; the stacked layout always has
-// `grid_cols = 1` so navigation works linearly.
-const CARD_H: u16 = STACKED_CARD_H + STACKED_GAP;
+// Sidebar (left) / detail (right) split layout.
+const SIDEBAR_W: u16 = 30;
+const SIDEBAR_ROW_H: u16 = 3;
 
-fn draw_cards(
+fn draw_split(
     f: &mut ratatui::Frame,
     sessions: &[SessionInfo],
     selected: usize,
     tick_phase: u32,
     area: Rect,
-) -> u16 {
-    // Auto-scroll: if the selected card would be cut off below the visible
-    // area, shift the viewport down so it stays in view. This is a small
-    // courtesy for the >6-sessions case, which our redesign explicitly
-    // de-prioritizes but shouldn't break.
-    let stride = STACKED_CARD_H + STACKED_GAP;
-    let visible_rows = area.height.saturating_sub(STACKED_CARD_H);
-    let max_visible = (visible_rows / stride).saturating_add(1) as usize;
-    let scroll_off = selected.saturating_sub(max_visible.saturating_sub(1));
+) {
+    if area.width < SIDEBAR_W + 30 {
+        // Terminal too narrow for split — fall back to a stacked single column.
+        draw_sidebar(f, sessions, selected, tick_phase, area);
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(SIDEBAR_W),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    draw_sidebar(f, sessions, selected, tick_phase, chunks[0]);
+    // Vertical separator
+    for y in chunks[1].y..chunks[1].y + chunks[1].height {
+        f.render_widget(
+            Paragraph::new("│").style(Style::default().fg(Color::DarkGray)),
+            Rect::new(chunks[1].x, y, 1, 1),
+        );
+    }
+    if let Some(s) = sessions.get(selected) {
+        draw_detail(f, s, tick_phase, chunks[2]);
+    }
+}
+
+fn draw_sidebar(
+    f: &mut ratatui::Frame,
+    sessions: &[SessionInfo],
+    selected: usize,
+    tick_phase: u32,
+    area: Rect,
+) {
+    let stride = SIDEBAR_ROW_H;
+    let max_visible = ((area.height + 1) / stride) as usize;
+    let scroll_off = selected.saturating_sub(max_visible.saturating_sub(1).max(0));
 
     for (idx, s) in sessions.iter().enumerate() {
         if idx < scroll_off {
@@ -1361,13 +1392,198 @@ fn draw_cards(
         }
         let render_row = (idx - scroll_off) as u16;
         let y = area.y + render_row * stride;
-        if y + STACKED_CARD_H > area.y + area.height {
+        if y + 2 > area.y + area.height {
             break;
         }
-        let card_area = Rect::new(area.x, y, area.width, STACKED_CARD_H);
-        draw_card(f, s, idx == selected, tick_phase, card_area);
+        draw_sidebar_entry(
+            f,
+            s,
+            idx == selected,
+            tick_phase,
+            Rect::new(area.x, y, area.width, 2),
+        );
     }
-    1u16
+}
+
+fn draw_sidebar_entry(
+    f: &mut ratatui::Frame,
+    s: &SessionInfo,
+    selected: bool,
+    tick_phase: u32,
+    area: Rect,
+) {
+    let color = status_color_pulsed(&s.status, tick_phase);
+    let glyph = status_glyph(&s.status, tick_phase);
+
+    let (title, title_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
+        Some(t) if !t.is_empty() => (t.to_string(), true),
+        _ => (s.name.clone(), false),
+    };
+    let title_style = if title_is_auto {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+    };
+
+    use ratatui::text::{Line, Span};
+
+    let accent = if selected { "▎" } else { " " };
+    let accent_style = if selected {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    // Row 1: ▎ glyph  title
+    let title_avail = area.width.saturating_sub(4) as usize;
+    let title_truncated = truncate_ellipsis(&title, title_avail);
+    let title_line = Line::from(vec![
+        Span::styled(accent, accent_style),
+        Span::styled(format!(" {glyph} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(title_truncated, title_style),
+    ]);
+    f.render_widget(
+        Paragraph::new(title_line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    // Row 2 (indented): status · time-ago
+    let status_label = display_status(&s.status);
+    let time_ago = format_time_ago(s.last_activity_ms);
+    let exit_part = s.exit_code.map(|c| format!(" · exit {c}")).unwrap_or_default();
+    let meta_line = Line::from(vec![
+        Span::raw("    "),
+        Span::styled(status_label, Style::default().fg(color)),
+        Span::styled(format!(" · {time_ago}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(meta_line),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+}
+
+fn draw_detail(f: &mut ratatui::Frame, s: &SessionInfo, tick_phase: u32, area: Rect) {
+    let color = status_color_pulsed(&s.status, tick_phase);
+    let glyph = status_glyph(&s.status, tick_phase);
+    let (title, title_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
+        Some(t) if !t.is_empty() => (t.to_string(), true),
+        _ => (s.name.clone(), false),
+    };
+    let title_style = if title_is_auto {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+    };
+
+    use ratatui::text::{Line, Span};
+
+    let pad = Rect::new(
+        area.x + 2,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
+
+    // Header: glyph  title  ·  status  ·  uptime  ·  time-ago  ·  model
+    let status_label = display_status(&s.status);
+    let uptime = format_uptime(s.started_at_ms);
+    let time_ago = format_time_ago(s.last_activity_ms);
+    let model = s.model.as_deref().map(short_model).unwrap_or("—");
+    let header_line = Line::from(vec![
+        Span::styled(format!("{glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(title, title_style),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status_label, Style::default().fg(color)),
+        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("  ·  {model}"), Style::default().fg(Color::Magenta)),
+    ]);
+    f.render_widget(Paragraph::new(header_line), Rect::new(pad.x, pad.y, pad.width, 1));
+
+    // Separator
+    f.render_widget(
+        Paragraph::new("─".repeat(pad.width as usize))
+            .style(Style::default().fg(Color::DarkGray)),
+        Rect::new(pad.x, pad.y + 1, pad.width, 1),
+    );
+
+    let cost = s.model.as_deref().map(|m| estimate_cost(m, s)).unwrap_or(0.0);
+    let cwd = shorten_path_left(&shorten_home(&s.cwd), pad.width.saturating_sub(12) as usize);
+    let label = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::White);
+    let row = |k: &'static str, v: String, vstyle: Style| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{:<10}", k), label),
+            Span::styled(v, vstyle),
+        ])
+    };
+
+    let mut info_lines: Vec<Line> = Vec::new();
+    info_lines.push(row("cwd", cwd, Style::default().fg(Color::Blue)));
+    info_lines.push(row("turns", s.turn_count.to_string(), val));
+    if let Some(t) = &s.current_tool {
+        info_lines.push(row(
+            "tool",
+            format!("⚙ {}", truncate_ellipsis(t, pad.width.saturating_sub(14) as usize)),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    let info_h = info_lines.len() as u16;
+    f.render_widget(
+        Paragraph::new(info_lines),
+        Rect::new(pad.x, pad.y + 3, pad.width, info_h),
+    );
+
+    // Last message section
+    let msg_y = pad.y + 3 + info_h + 1;
+    if msg_y < pad.y + pad.height {
+        f.render_widget(
+            Paragraph::new("last message").style(label),
+            Rect::new(pad.x, msg_y, pad.width, 1),
+        );
+        let msg_text = match s.last_message.as_deref() {
+            Some(m) if !m.is_empty() => m.to_string(),
+            _ => "(no messages yet)".to_string(),
+        };
+        let msg_style = if s.last_message.is_some() {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+        };
+        let msg_h = (pad.height.saturating_sub(msg_y - pad.y + 1)).min(6).max(1);
+        if msg_y + 1 < pad.y + pad.height {
+            f.render_widget(
+                Paragraph::new(format!("  {msg_text}"))
+                    .style(msg_style)
+                    .wrap(Wrap { trim: false }),
+                Rect::new(pad.x, msg_y + 1, pad.width, msg_h),
+            );
+        }
+    }
+
+    // Stats — anchor to bottom of detail pane
+    let stats_line = Line::from(vec![
+        Span::styled(
+            format!("{} → {}", compact_num(s.tokens_input), compact_num(s.tokens_output)),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
+            format!("  ·  cache {}", compact_num(s.tokens_cache_read)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("  ·  {}", format_cost(cost)),
+            Style::default().fg(Color::Green),
+        ),
+    ]);
+    if pad.height >= 2 {
+        let stats_y = pad.y + pad.height - 1;
+        f.render_widget(
+            Paragraph::new(stats_line),
+            Rect::new(pad.x, stats_y, pad.width, 1),
+        );
+    }
 }
 
 fn status_color(status: &str) -> Color {
