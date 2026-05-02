@@ -1112,25 +1112,47 @@ fn draw_spawn_form(
         Paragraph::new(cwd.to_string()).style(Style::default().fg(Color::White)),
         chunks[1],
     );
+    // Verify-by-eye that the args row is actually being drawn: leave a mini
+    // status crumb on the args label that shows the current arg-string length.
+    // (Useful for diagnosing "I typed but I see nothing"; can be removed once
+    // confirmed working.)
+    let args_crumb = format!("  ({} chars)", args.chars().count());
+    let crumb_w = args_crumb.chars().count() as u16;
+    let crumb_x = chunks[3].x + chunks[3].width.saturating_sub(crumb_w);
+    f.render_widget(
+        Paragraph::new(args_crumb).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(crumb_x, chunks[3].y, crumb_w, 1),
+    );
 
     f.render_widget(
         Paragraph::new(flags_label)
             .style(if focus == FormField::Args { label_active } else { label_dim }),
         chunks[3],
     );
-    if args.is_empty() && focus != FormField::Args {
-        // Placeholder hint inside the empty input box.
-        f.render_widget(
-            Paragraph::new("(none — claude runs with default behavior)")
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-            chunks[4],
-        );
+
+    // Always render the args text — no conditional placeholder. Putting a
+    // visible "▎ " gutter at the start of the row makes the field obvious
+    // even when empty, and `replace_all` ratatui's Buffer with a fresh
+    // styled Paragraph means there's no stale-cell bleed-through from a
+    // prior frame's placeholder string.
+    let args_display = if args.is_empty() {
+        if focus == FormField::Args {
+            String::new() // cursor-only; the bar marker still shows below
+        } else {
+            "(empty — claude runs with default flags)".to_string()
+        }
     } else {
-        f.render_widget(
-            Paragraph::new(args.to_string()).style(Style::default().fg(Color::White)),
-            chunks[4],
-        );
-    }
+        args.to_string()
+    };
+    let args_style = if args.is_empty() && focus != FormField::Args {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    f.render_widget(
+        Paragraph::new(args_display).style(args_style),
+        chunks[4],
+    );
     f.render_widget(
         Paragraph::new("e.g.  --dangerously-skip-permissions   --system-prompt \"…\"   --effort xhigh   --add-dir <path>")
             .style(Style::default().fg(Color::DarkGray)),
