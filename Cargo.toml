@@ -1,6 +1,6 @@
 [package]
 name = "claws"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "TUI multiplexer for Claude Code sessions"
 repository = "https://github.com/dodontommy/multi-claude"
