@@ -306,17 +306,14 @@ async fn handle_mouse(ev: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => app.move_down(),
         MouseEventKind::Down(MouseButton::Left) => {
             // Body area starts at row 2 (after title + separator).
+            // Stacked layout: cards are full-width, one per row, stride is
+            // STACKED_CARD_H + STACKED_GAP.
             let body_y0 = 2u16;
             if ev.row < body_y0 {
                 return;
             }
-            let cols = app.grid_cols.max(1);
             let row = (ev.row - body_y0) / CARD_H;
-            let col = ev.column / CARD_W;
-            if col >= cols {
-                return;
-            }
-            let idx = row as usize * cols as usize + col as usize;
+            let idx = row as usize;
             if idx >= app.visible_count() {
                 return;
             }
@@ -1336,8 +1333,11 @@ fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
     }
 }
 
-const CARD_W: u16 = 44;
-const CARD_H: u16 = 7;
+const STACKED_CARD_H: u16 = 7;
+const STACKED_GAP: u16 = 1;
+// Kept around for the mouse hit-test math; the stacked layout always has
+// `grid_cols = 1` so navigation works linearly.
+const CARD_H: u16 = STACKED_CARD_H + STACKED_GAP;
 
 fn draw_cards(
     f: &mut ratatui::Frame,
@@ -1346,20 +1346,28 @@ fn draw_cards(
     tick_phase: u32,
     area: Rect,
 ) -> u16 {
-    let cols = ((area.width / CARD_W).max(1)) as usize;
+    // Auto-scroll: if the selected card would be cut off below the visible
+    // area, shift the viewport down so it stays in view. This is a small
+    // courtesy for the >6-sessions case, which our redesign explicitly
+    // de-prioritizes but shouldn't break.
+    let stride = STACKED_CARD_H + STACKED_GAP;
+    let visible_rows = area.height.saturating_sub(STACKED_CARD_H);
+    let max_visible = (visible_rows / stride).saturating_add(1) as usize;
+    let scroll_off = selected.saturating_sub(max_visible.saturating_sub(1));
+
     for (idx, s) in sessions.iter().enumerate() {
-        let row = (idx / cols) as u16;
-        let col = (idx % cols) as u16;
-        let x = area.x + col * CARD_W;
-        let y = area.y + row * CARD_H;
-        if y + CARD_H > area.y + area.height {
+        if idx < scroll_off {
+            continue;
+        }
+        let render_row = (idx - scroll_off) as u16;
+        let y = area.y + render_row * stride;
+        if y + STACKED_CARD_H > area.y + area.height {
             break;
         }
-        let w = CARD_W.min(area.width.saturating_sub(col * CARD_W));
-        let card_area = Rect::new(x, y, w, CARD_H);
+        let card_area = Rect::new(area.x, y, area.width, STACKED_CARD_H);
         draw_card(f, s, idx == selected, tick_phase, card_area);
     }
-    cols as u16
+    1u16
 }
 
 fn status_color(status: &str) -> Color {
@@ -1414,26 +1422,34 @@ fn draw_card(
     };
 
     let glyph = status_glyph(&s.status, tick_phase);
-    let (title_label, title_is_auto) = match s.ai_title.as_deref() {
+    let (title_label, title_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
         Some(t) if !t.is_empty() => (t.to_string(), true),
         _ => (s.name.clone(), false),
     };
     let title_style = if title_is_auto {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
-        // Fallback name (cwd basename) — render dimmer/italic so it's visually
-        // clear we're still waiting for Claude to name the conversation.
-        Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::ITALIC)
+        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
     };
-    use ratatui::text::{Line as RLine, Span as RSpan};
-    let title_line = RLine::from(vec![
-        RSpan::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        RSpan::styled(title_label, title_style),
-        RSpan::raw(" "),
+
+    use ratatui::text::{Line, Span};
+
+    let status_label = display_status(&s.status);
+    let uptime = format_uptime(s.started_at_ms);
+    let time_ago = format_time_ago(s.last_activity_ms);
+    let model = s.model.as_deref().map(short_model).unwrap_or("—");
+
+    // Title spans the top border. Pack the most important identifying
+    // info in here — name, status, uptime, last-active, model — so the
+    // card body can focus on session content (last message + stats).
+    let title_line = Line::from(vec![
+        Span::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(title_label, title_style),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status_label, Style::default().fg(color)),
+        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("  ·  {model} "), Style::default().fg(Color::Magenta)),
     ]);
 
     let block = Block::default()
@@ -1444,44 +1460,38 @@ fn draw_card(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    use ratatui::text::{Line, Span};
-
-    // Inner padding: 1 char left margin
-    let pad = Rect::new(
-        inner.x.saturating_add(1),
+    // Inner is 5 rows high (STACKED_CARD_H=7 minus 2 borders). Lay out as:
+    //   row 0: top padding (blank)
+    //   row 1: cwd (blue)
+    //   row 2: last message (italic gray, full-width)
+    //   row 3: stats line (turns / tokens / cost / current_tool / exit)
+    //   row 4: bottom padding (blank)
+    // 2-col left padding inside.
+    let body = Rect::new(
+        inner.x + 2,
         inner.y,
-        inner.width.saturating_sub(2),
+        inner.width.saturating_sub(4),
         inner.height,
     );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // top pad
+            Constraint::Length(1), // cwd
+            Constraint::Length(1), // last message
+            Constraint::Length(1), // stats
+            Constraint::Length(1), // bottom pad
+        ])
+        .split(body);
 
-    let time_ago = format_time_ago(s.last_activity_ms);
-    let uptime = format_uptime(s.started_at_ms);
-    let status_label = display_status(&s.status);
-    let tool_part = s
-        .current_tool
-        .as_deref()
-        .map(|t| format!("  ·  {}", truncate_ellipsis(t, 18)))
-        .unwrap_or_default();
-    let exit_part = s.exit_code.map(|c| format!("  ·  exit {c}")).unwrap_or_default();
+    let cwd_short = shorten_path_left(&shorten_home(&s.cwd), chunks[1].width as usize);
+    f.render_widget(
+        Paragraph::new(cwd_short).style(Style::default().fg(Color::Blue)),
+        chunks[1],
+    );
 
-    let line1 = Line::from(vec![
-        Span::styled(status_label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::Gray)),
-        Span::styled(format!("  ·  up {uptime}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(tool_part, Style::default().fg(Color::Cyan)),
-        Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
-    ]);
-
-    let cwd_avail = pad.width as usize;
-    let cwd_short = shorten_path_left(&shorten_home(&s.cwd), cwd_avail);
-    let line2 = Line::from(Span::styled(
-        cwd_short,
-        Style::default().fg(Color::Blue),
-    ));
-
-    let preview_avail = pad.width as usize;
     let preview = match s.last_message.as_deref() {
-        Some(m) if !m.is_empty() => truncate_ellipsis(m, preview_avail),
+        Some(m) if !m.is_empty() => truncate_ellipsis(m, chunks[2].width as usize),
         _ => "(no messages yet)".to_string(),
     };
     let preview_style = if s.last_message.is_some() {
@@ -1489,25 +1499,36 @@ fn draw_card(
     } else {
         Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
     };
-    let line3 = Line::from(Span::styled(preview, preview_style));
-
-    let model = s.model.as_deref().map(short_model).unwrap_or("—");
-    let cost = s.model.as_deref().map(|m| estimate_cost(m, s)).unwrap_or(0.0);
-    let toks = format!(
-        "{}t  ·  {}→{}  ·  ◷ {}",
-        s.turn_count,
-        compact_num(s.tokens_input),
-        compact_num(s.tokens_output),
-        compact_num(s.tokens_cache_read),
+    f.render_widget(
+        Paragraph::new(preview).style(preview_style),
+        chunks[2],
     );
-    let line4 = Line::from(vec![
-        Span::styled(model.to_string(), Style::default().fg(Color::Magenta)),
-        Span::styled(format!("  ·  {}", format_cost(cost)), Style::default().fg(Color::Green)),
-        Span::styled(format!("  ·  {toks}"), Style::default().fg(Color::DarkGray)),
-    ]);
 
-    let p = Paragraph::new(vec![line1, line2, line3, line4]).wrap(Wrap { trim: false });
-    f.render_widget(p, pad);
+    let cost = s.model.as_deref().map(|m| estimate_cost(m, s)).unwrap_or(0.0);
+    let tool_part = s
+        .current_tool
+        .as_deref()
+        .map(|t| format!("  ·  ⚙ {}", truncate_ellipsis(t, 24)))
+        .unwrap_or_default();
+    let exit_part = s.exit_code.map(|c| format!("  ·  exit {c}")).unwrap_or_default();
+    let stats_line = Line::from(vec![
+        Span::styled(format!("{}t", s.turn_count), Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("  ·  {} → {}", compact_num(s.tokens_input), compact_num(s.tokens_output)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("  ·  cache {}", compact_num(s.tokens_cache_read)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("  ·  {}", format_cost(cost)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(tool_part, Style::default().fg(Color::Cyan)),
+        Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(stats_line), chunks[3]);
 }
 
 fn shorten_home(path: &str) -> String {
