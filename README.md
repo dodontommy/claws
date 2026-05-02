@@ -23,13 +23,13 @@ brew install dodontommy/tap/claws
 Linux:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/multi-claude/releases/latest/download/claws-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/claws/releases/latest/download/claws-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -c "irm https://github.com/dodontommy/multi-claude/releases/latest/download/claws-installer.ps1 | iex"
+powershell -c "irm https://github.com/dodontommy/claws/releases/latest/download/claws-installer.ps1 | iex"
 ```
 
 You also need `claude` (the Claude Code CLI itself) on your PATH. claws spawns it as a subprocess.

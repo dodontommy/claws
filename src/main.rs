@@ -120,8 +120,8 @@ async fn run_update() -> Result<()> {
             "install receipt missing — `claws` was probably installed via `cargo install` \
              rather than the official installer.\n\n\
              To enable in-place updates, reinstall via one of:\n  \
-               curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/multi-claude/releases/latest/download/claws-installer.sh | sh\n  \
-               powershell -c \"irm https://github.com/dodontommy/multi-claude/releases/latest/download/claws-installer.ps1 | iex\"\n  \
+               curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/claws/releases/latest/download/claws-installer.sh | sh\n  \
+               powershell -c \"irm https://github.com/dodontommy/claws/releases/latest/download/claws-installer.ps1 | iex\"\n  \
                brew install dodontommy/tap/claws\n\n\
              Underlying error: {e}"
         );
