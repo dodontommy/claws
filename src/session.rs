@@ -92,6 +92,7 @@ pub fn spawn_session(
     model: Option<String>,
     settings_path: Option<PathBuf>,
     mode: SpawnMode,
+    extra_args: Vec<String>,
 ) -> Result<Session> {
     let display_name = name.unwrap_or_else(|| {
         cwd.file_name()
@@ -123,6 +124,9 @@ pub fn spawn_session(
     if let Some(s) = &settings_path {
         cmd.arg("--settings");
         cmd.arg(s.to_string_lossy().as_ref());
+    }
+    for a in &extra_args {
+        cmd.arg(a);
     }
     cmd.cwd(&cwd);
     for (k, v) in std::env::vars() {

@@ -45,10 +45,19 @@ enum View {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormField {
+    Cwd,
+    Args,
+}
+
 enum Modal {
-    CwdPicker {
-        input: String,
-        cursor: usize,
+    SpawnForm {
+        cwd: String,
+        cwd_cursor: usize,
+        args: String,
+        args_cursor: usize,
+        focus: FormField,
         recent_selected: usize,
     },
 }
@@ -62,6 +71,10 @@ struct App {
     tick_phase: u32,
     modal: Option<Modal>,
     recent_cwds: Vec<String>,
+    /// Columns in the current dashboard grid (recomputed on each render).
+    /// Used by j/k/h/l navigation so j actually goes "down a row" not "right
+    /// to the next card."
+    grid_cols: u16,
 }
 
 impl App {
@@ -82,6 +95,7 @@ impl App {
             tick_phase: 0,
             modal: None,
             recent_cwds: recent,
+            grid_cols: 1,
         }
     }
 
@@ -94,11 +108,24 @@ impl App {
     }
 
     fn move_up(&mut self) {
+        let cols = self.grid_cols.max(1) as usize;
+        if self.selected >= cols {
+            self.selected -= cols;
+        }
+    }
+    fn move_down(&mut self) {
+        let cols = self.grid_cols.max(1) as usize;
+        let target = self.selected + cols;
+        if target < self.sessions.len() {
+            self.selected = target;
+        }
+    }
+    fn move_left(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
         }
     }
-    fn move_down(&mut self) {
+    fn move_right(&mut self) {
         if self.selected + 1 < self.sessions.len() {
             self.selected += 1;
         }
@@ -231,82 +258,144 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App) {
         None => return,
     };
     match modal {
-        Modal::CwdPicker {
-            input,
-            cursor,
+        Modal::SpawnForm {
+            cwd,
+            cwd_cursor,
+            args,
+            args_cursor,
+            focus,
             recent_selected,
         } => match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => app.modal = None,
             (KeyCode::Enter, _) => {
-                let cwd = input.trim().to_string();
-                if cwd.is_empty() {
+                let cwd_v = cwd.trim().to_string();
+                if cwd_v.is_empty() {
                     app.set_status("cwd is empty".into());
                     return;
                 }
-                if !PathBuf::from(&cwd).is_dir() {
-                    app.set_status(format!("not a directory: {cwd}"));
+                if !PathBuf::from(&cwd_v).is_dir() {
+                    app.set_status(format!("not a directory: {cwd_v}"));
                     return;
                 }
+                let extra: Vec<String> = match shell_words::split(args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        app.set_status(format!("bad args: {e}"));
+                        return;
+                    }
+                };
                 app.modal = None;
-                match client::create_session_raw(cwd.clone(), None, None).await {
+                match client::create_session_raw(cwd_v.clone(), None, None, extra).await {
                     Ok(_) => {
-                        app.push_recent_cwd(cwd);
+                        app.push_recent_cwd(cwd_v);
                         app.set_status("session created".into());
                         refresh_sessions(app).await;
                     }
                     Err(e) => app.set_status(format!("create failed: {e}")),
                 }
             }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
-                input.insert(*cursor, c);
-                *cursor += c.len_utf8();
+            (KeyCode::Tab, _) => {
+                *focus = match focus {
+                    FormField::Cwd => FormField::Args,
+                    FormField::Args => FormField::Cwd,
+                };
             }
-            (KeyCode::Backspace, _) => {
-                if *cursor > 0 {
-                    let mut new = String::new();
-                    let mut taken = 0;
-                    let target = *cursor;
-                    let mut last_char_len = 0;
-                    for ch in input.chars() {
-                        let len = ch.len_utf8();
-                        if taken + len == target {
-                            last_char_len = len;
-                            break;
-                        }
-                        new.push(ch);
-                        taken += len;
-                    }
-                    let mut after = String::new();
-                    let mut idx = 0;
-                    for ch in input.chars() {
-                        let len = ch.len_utf8();
-                        idx += len;
-                        if idx > target {
-                            after.push(ch);
-                        }
-                    }
-                    *input = new + &after;
-                    *cursor -= last_char_len;
-                }
-            }
-            (KeyCode::Up, _) => {
+            (KeyCode::Up, _) if *focus == FormField::Cwd => {
                 if *recent_selected > 0 {
                     *recent_selected -= 1;
+                    if let Some(pick) = app.recent_cwds.get(*recent_selected) {
+                        *cwd = pick.clone();
+                        *cwd_cursor = cwd.len();
+                    }
                 }
             }
-            (KeyCode::Down, _) => {
+            (KeyCode::Down, _) if *focus == FormField::Cwd => {
                 if *recent_selected + 1 < app.recent_cwds.len() {
                     *recent_selected += 1;
+                    if let Some(pick) = app.recent_cwds.get(*recent_selected) {
+                        *cwd = pick.clone();
+                        *cwd_cursor = cwd.len();
+                    }
                 }
             }
-            (KeyCode::Tab, _) => {
-                if let Some(pick) = app.recent_cwds.get(*recent_selected) {
-                    *input = pick.clone();
-                    *cursor = input.len();
-                }
+            _ => {
+                let (input, cursor) = match focus {
+                    FormField::Cwd => (cwd, cwd_cursor),
+                    FormField::Args => (args, args_cursor),
+                };
+                handle_text_input(input, cursor, &key);
             }
-            _ => {}
         },
+    }
+}
+
+fn handle_text_input(input: &mut String, cursor: &mut usize, key: &KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+            input.insert(*cursor, c);
+            *cursor += c.len_utf8();
+        }
+        (KeyCode::Backspace, _) => input_backspace(input, cursor),
+        (KeyCode::Delete, _) => input_delete(input, cursor),
+        (KeyCode::Left, _) => input_move_left(input, cursor),
+        (KeyCode::Right, _) => input_move_right(input, cursor),
+        (KeyCode::Home, _) => *cursor = 0,
+        (KeyCode::End, _) => *cursor = input.len(),
+        _ => {}
+    }
+}
+
+fn input_backspace(input: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let mut prev = 0;
+    let mut i = 0;
+    for ch in input.chars() {
+        let next = i + ch.len_utf8();
+        if next == *cursor {
+            prev = i;
+            break;
+        }
+        i = next;
+    }
+    input.replace_range(prev..*cursor, "");
+    *cursor = prev;
+}
+
+fn input_delete(input: &mut String, cursor: &mut usize) {
+    if *cursor >= input.len() {
+        return;
+    }
+    if let Some(ch) = input[*cursor..].chars().next() {
+        let end = *cursor + ch.len_utf8();
+        input.replace_range(*cursor..end, "");
+    }
+}
+
+fn input_move_left(input: &str, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let mut prev = 0;
+    let mut i = 0;
+    for ch in input.chars() {
+        let next = i + ch.len_utf8();
+        if next == *cursor {
+            prev = i;
+            break;
+        }
+        i = next;
+    }
+    *cursor = prev;
+}
+
+fn input_move_right(input: &str, cursor: &mut usize) {
+    if *cursor >= input.len() {
+        return;
+    }
+    if let Some(ch) = input[*cursor..].chars().next() {
+        *cursor += ch.len_utf8();
     }
 }
 
@@ -316,6 +405,8 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => app.quit = true,
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.move_down(),
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_up(),
+        (KeyCode::Char('h'), _) | (KeyCode::Left, _) => app.move_left(),
+        (KeyCode::Char('l'), _) | (KeyCode::Right, _) => app.move_right(),
         (KeyCode::Char('r'), KeyModifiers::NONE) => {
             refresh_sessions(app).await;
             app.set_status("refreshed".into());
@@ -325,9 +416,12 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let cursor = pwd.len();
-            app.modal = Some(Modal::CwdPicker {
-                input: pwd,
-                cursor,
+            app.modal = Some(Modal::SpawnForm {
+                cwd: pwd,
+                cwd_cursor: cursor,
+                args: String::new(),
+                args_cursor: 0,
+                focus: FormField::Cwd,
                 recent_selected: 0,
             });
         }
@@ -528,25 +622,40 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
 fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
     match modal {
-        Modal::CwdPicker {
-            input,
-            cursor,
+        Modal::SpawnForm {
+            cwd,
+            cwd_cursor,
+            args,
+            args_cursor,
+            focus,
             recent_selected,
-        } => draw_cwd_picker(f, input, *cursor, *recent_selected, &app.recent_cwds),
+        } => draw_spawn_form(
+            f,
+            cwd,
+            *cwd_cursor,
+            args,
+            *args_cursor,
+            *focus,
+            *recent_selected,
+            &app.recent_cwds,
+        ),
     }
 }
 
-fn draw_cwd_picker(
+fn draw_spawn_form(
     f: &mut ratatui::Frame,
-    input: &str,
-    cursor: usize,
+    cwd: &str,
+    cwd_cursor: usize,
+    args: &str,
+    args_cursor: usize,
+    focus: FormField,
     recent_selected: usize,
     recent: &[String],
 ) {
     let parent = f.area();
-    let w = 70.min(parent.width.saturating_sub(4));
-    let recent_rows = recent.len().min(8) as u16;
-    let h = 6 + recent_rows;
+    let w = 78.min(parent.width.saturating_sub(4));
+    let recent_rows = recent.len().min(6) as u16;
+    let h = 9 + recent_rows;
     let area = centered_rect(w, h, parent);
 
     f.render_widget(Clear, area);
@@ -564,11 +673,14 @@ fn draw_cwd_picker(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // label
-            Constraint::Length(1), // input
+            Constraint::Length(1), // cwd label
+            Constraint::Length(1), // cwd input
+            Constraint::Length(1), // gap
+            Constraint::Length(1), // args label
+            Constraint::Length(1), // args input
             Constraint::Length(1), // separator
             Constraint::Length(1), // recent label
-            Constraint::Min(0),    // recent list
+            Constraint::Min(1),    // recent list
             Constraint::Length(1), // help
         ])
         .split(Rect::new(
@@ -578,53 +690,81 @@ fn draw_cwd_picker(
             inner.height,
         ));
 
+    let label_style = Style::default().fg(Color::DarkGray);
+    let active_label = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
     f.render_widget(
-        Paragraph::new("cwd").style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("cwd").style(if focus == FormField::Cwd { active_label } else { label_style }),
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
+        Paragraph::new(cwd.to_string()).style(Style::default().fg(Color::White)),
         chunks[1],
     );
-    f.set_cursor_position(Position::new(
-        chunks[1].x + cursor as u16,
-        chunks[1].y,
-    ));
 
     f.render_widget(
-        Paragraph::new("─".repeat(chunks[2].width as usize))
+        Paragraph::new("args   (e.g. --dangerously-skip-permissions  --system-prompt \"…\")  shell-quoted")
+            .style(if focus == FormField::Args { active_label } else { label_style }),
+        chunks[3],
+    );
+    f.render_widget(
+        Paragraph::new(args.to_string()).style(Style::default().fg(Color::White)),
+        chunks[4],
+    );
+
+    // Cursor on whichever field is focused.
+    match focus {
+        FormField::Cwd => {
+            f.set_cursor_position(Position::new(
+                chunks[1].x + cwd_cursor as u16,
+                chunks[1].y,
+            ));
+        }
+        FormField::Args => {
+            f.set_cursor_position(Position::new(
+                chunks[4].x + args_cursor as u16,
+                chunks[4].y,
+            ));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new("─".repeat(chunks[5].width as usize))
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        chunks[5],
     );
     f.render_widget(
         Paragraph::new("recent").style(Style::default().fg(Color::DarkGray)),
-        chunks[3],
+        chunks[6],
     );
 
-    let visible = recent.iter().take(8).enumerate();
-    for (i, dir) in visible {
-        let y = chunks[4].y + i as u16;
-        if y >= chunks[4].y + chunks[4].height {
+    for (i, dir) in recent.iter().take(6).enumerate() {
+        let y = chunks[7].y + i as u16;
+        if y >= chunks[7].y + chunks[7].height {
             break;
         }
-        let marker = if i == recent_selected { "› " } else { "  " };
-        let style = if i == recent_selected {
+        let marker = if i == recent_selected && focus == FormField::Cwd {
+            "› "
+        } else {
+            "  "
+        };
+        let style = if i == recent_selected && focus == FormField::Cwd {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
-        let avail = chunks[4].width.saturating_sub(2) as usize;
+        let avail = chunks[7].width.saturating_sub(2) as usize;
         let line = format!("{marker}{}", truncate_ellipsis(&shorten_home(dir), avail));
         f.render_widget(
             Paragraph::new(line).style(style),
-            Rect::new(chunks[4].x, y, chunks[4].width, 1),
+            Rect::new(chunks[7].x, y, chunks[7].width, 1),
         );
     }
 
     f.render_widget(
-        Paragraph::new(" enter create   ·   tab fill from recent   ·   ↑/↓ pick   ·   esc cancel")
+        Paragraph::new(" enter create   ·   tab field   ·   ↑/↓ recent (in cwd)   ·   esc cancel")
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[5],
+        chunks[8],
     );
 }
 
@@ -682,7 +822,15 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     if app.sessions.is_empty() {
         draw_empty_state(f, chunks[1]);
     } else {
-        draw_cards(f, &app.sessions, app.selected, app.tick_phase, chunks[1]);
+        let cols = draw_cards(f, &app.sessions, app.selected, app.tick_phase, chunks[1]);
+        // Stash the rendered grid width for j/k navigation. RefCell-free hack:
+        // we mutate via a raw pointer because draw is called with `&App`. This
+        // is a single-thread access from the render path, but cleaner long-term
+        // would be to compute cols in the event loop instead.
+        let app_ptr = app as *const App as *mut App;
+        unsafe {
+            (*app_ptr).grid_cols = cols;
+        }
     }
 
     // Footer separator + help/status line
@@ -694,7 +842,8 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     let status_text = if let Some((msg, _)) = &app.status_message {
         format!(" {msg}")
     } else {
-        " j/k  move    enter  attach    c  new    x  close    r  refresh    q  quit".to_string()
+        " hjkl/↑↓←→  move    enter  attach    c  new    x  close    r  refresh    q  quit"
+            .to_string()
     };
     f.render_widget(
         Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
@@ -740,7 +889,7 @@ fn draw_cards(
     selected: usize,
     tick_phase: u32,
     area: Rect,
-) {
+) -> u16 {
     let cols = ((area.width / CARD_W).max(1)) as usize;
     for (idx, s) in sessions.iter().enumerate() {
         let row = (idx / cols) as u16;
@@ -754,6 +903,7 @@ fn draw_cards(
         let card_area = Rect::new(x, y, w, CARD_H);
         draw_card(f, s, idx == selected, tick_phase, card_area);
     }
+    cols as u16
 }
 
 fn status_color(status: &str) -> Color {
@@ -1071,9 +1221,9 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
     render_pty(f, parser, chunks[1]);
 
     let footer = if prefix_active {
-        " ◆ prefix:  d  detach    q  quit    ?  help    Ctrl-Space  literal".to_string()
+        " ◆ prefix:  d  detach    n/p  next/prev    1-9  jump    q  quit    ?  help".to_string()
     } else {
-        " Ctrl-Space  prefix    keys → claude".to_string()
+        " Ctrl-Space  prefix (d=detach n/p=cycle 1-9=jump)    keys → claude".to_string()
     };
     f.render_widget(
         Paragraph::new(footer).style(Style::default().fg(if prefix_active {

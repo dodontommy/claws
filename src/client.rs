@@ -27,7 +27,7 @@ pub async fn kill_server() -> Result<()> {
 }
 
 pub async fn create_session(cwd: String, name: Option<String>, model: Option<String>) -> Result<()> {
-    let params = json!({"cwd": cwd, "name": name, "model": model});
+    let params = json!({"cwd": cwd, "name": name, "model": model, "extra_args": Vec::<String>::new()});
     print_resp(&call_with_autospawn("create_session", params).await?);
     Ok(())
 }
@@ -84,8 +84,9 @@ pub async fn create_session_raw(
     cwd: String,
     name: Option<String>,
     model: Option<String>,
+    extra_args: Vec<String>,
 ) -> Result<SessionInfo> {
-    let params = json!({"cwd": cwd, "name": name, "model": model});
+    let params = json!({"cwd": cwd, "name": name, "model": model, "extra_args": extra_args});
     let resp = call_with_autospawn("create_session", params).await?;
     if let Some(e) = resp.error {
         return Err(anyhow!("{}: {}", e.code, e.message));

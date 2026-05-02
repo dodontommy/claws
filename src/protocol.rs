@@ -63,6 +63,11 @@ pub struct CreateSessionParams {
     pub name: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Extra args appended verbatim to the `claude` command line. Allows
+    /// `--dangerously-skip-permissions`, `--system-prompt "..."`, `--effort xhigh`,
+    /// `--add-dir <path>`, etc. Shell-split client-side before sending.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

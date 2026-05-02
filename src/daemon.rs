@@ -102,8 +102,9 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
         let cwd = ps.cwd.clone();
         let name = Some(ps.name.clone());
         let model = ps.model.clone();
+        let extra_args = ps.extra_args.clone();
         let result = tokio::task::spawn_blocking(move || {
-            spawn_session(id, cwd, name, model, settings_path, SpawnMode::Resume)
+            spawn_session(id, cwd, name, model, settings_path, SpawnMode::Resume, extra_args)
         })
         .await;
         match result {
@@ -224,8 +225,18 @@ async fn handle_create(
     let cwd_clone = cwd.clone();
     let name = p.name.clone();
     let model = p.model.clone();
+    let extra_args = p.extra_args.clone();
+    let extra_args_for_spawn = extra_args.clone();
     let session = match tokio::task::spawn_blocking(move || {
-        spawn_session(session_id, cwd_clone, name, model, settings_path, SpawnMode::Fresh)
+        spawn_session(
+            session_id,
+            cwd_clone,
+            name,
+            model,
+            settings_path,
+            SpawnMode::Fresh,
+            extra_args_for_spawn,
+        )
     })
     .await
     {
@@ -245,6 +256,7 @@ async fn handle_create(
         &session.name,
         session.model_requested.as_deref(),
         info.started_at_ms,
+        &extra_args,
     ) {
         tracing::warn!(error = %e, "failed to persist session metadata");
     }
