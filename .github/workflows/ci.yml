@@ -20,8 +20,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -38,11 +36,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --verbose
-
-      - name: cargo fmt (advisory)
-        run: cargo fmt --all -- --check
-        continue-on-error: true
-
-      - name: cargo clippy (advisory)
-        run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true
