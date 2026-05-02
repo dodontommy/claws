@@ -1,7 +1,10 @@
 use crate::client;
 use crate::protocol::SessionInfo;
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,14 +26,14 @@ const ATTACHED_CHROME_ROWS: u16 = 2;
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_inner(&mut terminal).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -60,6 +63,15 @@ enum Modal {
         focus: FormField,
         recent_selected: usize,
     },
+    Rename {
+        session_id: Uuid,
+        input: String,
+        cursor: usize,
+    },
+    Details {
+        session_id: Uuid,
+    },
+    Help,
 }
 
 struct App {
@@ -71,10 +83,10 @@ struct App {
     tick_phase: u32,
     modal: Option<Modal>,
     recent_cwds: Vec<String>,
-    /// Columns in the current dashboard grid (recomputed on each render).
-    /// Used by j/k/h/l navigation so j actually goes "down a row" not "right
-    /// to the next card."
     grid_cols: u16,
+    filter: Option<String>,
+    filter_cursor: usize,
+    last_click: Option<(usize, SystemTime)>,
 }
 
 impl App {
@@ -96,7 +108,35 @@ impl App {
             modal: None,
             recent_cwds: recent,
             grid_cols: 1,
+            filter: None,
+            filter_cursor: 0,
+            last_click: None,
         }
+    }
+
+    /// Sessions filtered by current filter string. Returned as references.
+    fn visible_sessions(&self) -> Vec<&SessionInfo> {
+        match &self.filter {
+            None => self.sessions.iter().collect(),
+            Some(f) if f.is_empty() => self.sessions.iter().collect(),
+            Some(f) => {
+                let needle = f.to_lowercase();
+                self.sessions
+                    .iter()
+                    .filter(|s| {
+                        s.name.to_lowercase().contains(&needle)
+                            || s.cwd.to_lowercase().contains(&needle)
+                            || s.ai_title.as_deref().map(|t| t.to_lowercase().contains(&needle)).unwrap_or(false)
+                            || s.display_override.as_deref().map(|d| d.to_lowercase().contains(&needle)).unwrap_or(false)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Map dashboard `selected` index to the actual SessionInfo via the visible list.
+    fn selected_session(&self) -> Option<SessionInfo> {
+        self.visible_sessions().get(self.selected).map(|s| (*s).clone())
     }
 
     fn push_recent_cwd(&mut self, cwd: String) {
@@ -105,6 +145,10 @@ impl App {
         if self.recent_cwds.len() > 20 {
             self.recent_cwds.truncate(20);
         }
+    }
+
+    fn visible_count(&self) -> usize {
+        self.visible_sessions().len()
     }
 
     fn move_up(&mut self) {
@@ -116,7 +160,7 @@ impl App {
     fn move_down(&mut self) {
         let cols = self.grid_cols.max(1) as usize;
         let target = self.selected + cols;
-        if target < self.sessions.len() {
+        if target < self.visible_count() {
             self.selected = target;
         }
     }
@@ -126,7 +170,7 @@ impl App {
         }
     }
     fn move_right(&mut self) {
-        if self.selected + 1 < self.sessions.len() {
+        if self.selected + 1 < self.visible_count() {
             self.selected += 1;
         }
     }
@@ -252,12 +296,88 @@ async fn handle_key(key: KeyEvent, app: &mut App) {
     }
 }
 
+async fn handle_mouse(ev: MouseEvent, app: &mut App) {
+    // Only act on dashboard for now; attached view forwards mouse to PTY in v.next.
+    if !matches!(app.view, View::Dashboard) || app.modal.is_some() {
+        return;
+    }
+    match ev.kind {
+        MouseEventKind::ScrollUp => app.move_up(),
+        MouseEventKind::ScrollDown => app.move_down(),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Body area starts at row 2 (after title + separator).
+            let body_y0 = 2u16;
+            if ev.row < body_y0 {
+                return;
+            }
+            let cols = app.grid_cols.max(1);
+            let row = (ev.row - body_y0) / CARD_H;
+            let col = ev.column / CARD_W;
+            if col >= cols {
+                return;
+            }
+            let idx = row as usize * cols as usize + col as usize;
+            if idx >= app.visible_count() {
+                return;
+            }
+            let now = SystemTime::now();
+            let dbl = match app.last_click {
+                Some((prev_idx, t))
+                    if prev_idx == idx
+                        && now.duration_since(t).unwrap_or_default()
+                            < Duration::from_millis(500) =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            app.selected = idx;
+            app.last_click = Some((idx, now));
+            if dbl {
+                attach_at_index(app, idx).await;
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_modal_key(key: KeyEvent, app: &mut App) {
+    // Help modal: any key closes it.
+    if matches!(app.modal, Some(Modal::Help)) {
+        app.modal = None;
+        return;
+    }
+    // Details modal: any key closes it.
+    if matches!(app.modal, Some(Modal::Details { .. })) {
+        app.modal = None;
+        return;
+    }
+    // Rename modal: text input + Enter/Esc.
+    if let Some(Modal::Rename { session_id, input, cursor }) = app.modal.as_mut() {
+        let session_id = *session_id;
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => app.modal = None,
+            (KeyCode::Enter, _) => {
+                let new = input.trim().to_string();
+                app.modal = None;
+                match client::rename_session_raw(session_id, new).await {
+                    Ok(()) => {
+                        app.set_status("renamed".into());
+                        refresh_sessions(app).await;
+                    }
+                    Err(e) => app.set_status(format!("rename failed: {e}")),
+                }
+            }
+            _ => handle_text_input(input, cursor, &key),
+        }
+        return;
+    }
     let modal = match app.modal.as_mut() {
         Some(m) => m,
         None => return,
     };
     match modal {
+        Modal::Help | Modal::Details { .. } | Modal::Rename { .. } => return,
         Modal::SpawnForm {
             cwd,
             cwd_cursor,
@@ -299,6 +419,23 @@ async fn handle_modal_key(key: KeyEvent, app: &mut App) {
                     FormField::Cwd => FormField::Args,
                     FormField::Args => FormField::Cwd,
                 };
+            }
+            (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
+                let flag = "--dangerously-skip-permissions";
+                if args.contains(flag) {
+                    let cleaned = args
+                        .split_whitespace()
+                        .filter(|t| *t != flag)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    *args = cleaned;
+                } else {
+                    if !args.is_empty() && !args.ends_with(' ') {
+                        args.push(' ');
+                    }
+                    args.push_str(flag);
+                }
+                *args_cursor = args.len();
             }
             (KeyCode::Up, _) if *focus == FormField::Cwd => {
                 if *recent_selected > 0 {
@@ -400,6 +537,41 @@ fn input_move_right(input: &str, cursor: &mut usize) {
 }
 
 async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
+    // Filter mode: capture all printable input until Esc/Enter.
+    if app.filter.is_some() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                app.filter = None;
+                app.filter_cursor = 0;
+                app.selected = 0;
+            }
+            (KeyCode::Enter, _) => {
+                // Exit filter input, but keep filter active. Esc on an active
+                // (non-typing) filter clears it — we route that through the
+                // first match case the next time the filter is non-empty.
+                if let Some(f) = &app.filter {
+                    if f.is_empty() {
+                        app.filter = None;
+                    }
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                if let Some(f) = app.filter.as_mut() {
+                    input_backspace(f, &mut app.filter_cursor);
+                }
+                app.selected = 0;
+            }
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                if let Some(f) = app.filter.as_mut() {
+                    f.insert(app.filter_cursor, c);
+                    app.filter_cursor += c.len_utf8();
+                }
+                app.selected = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) => app.quit = true,
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => app.quit = true,
@@ -407,7 +579,45 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.move_up(),
         (KeyCode::Char('h'), _) | (KeyCode::Left, _) => app.move_left(),
         (KeyCode::Char('l'), _) | (KeyCode::Right, _) => app.move_right(),
+        (KeyCode::Char('?'), _) => app.modal = Some(Modal::Help),
+        (KeyCode::Char('/'), _) => {
+            app.filter = Some(String::new());
+            app.filter_cursor = 0;
+            app.selected = 0;
+        }
+        (KeyCode::Char('i'), _) => {
+            if let Some(s) = app.selected_session() {
+                app.modal = Some(Modal::Details { session_id: s.id });
+            }
+        }
+        (KeyCode::Char('r'), KeyModifiers::SHIFT) | (KeyCode::Char('R'), _) => {
+            if let Some(s) = app.selected_session() {
+                match client::restart_session_raw(s.id).await {
+                    Ok(()) => {
+                        app.set_status("restarted".into());
+                        refresh_sessions(app).await;
+                    }
+                    Err(e) => app.set_status(format!("restart failed: {e}")),
+                }
+            }
+        }
         (KeyCode::Char('r'), KeyModifiers::NONE) => {
+            // Lowercase r → rename. Shift+R or capital R is restart, above.
+            if let Some(s) = app.selected_session() {
+                let initial = s
+                    .display_override
+                    .clone()
+                    .or_else(|| s.ai_title.clone())
+                    .unwrap_or_else(|| s.name.clone());
+                let cursor = initial.len();
+                app.modal = Some(Modal::Rename {
+                    session_id: s.id,
+                    input: initial,
+                    cursor,
+                });
+            }
+        }
+        (KeyCode::F(5), _) => {
             refresh_sessions(app).await;
             app.set_status("refreshed".into());
         }
@@ -426,7 +636,7 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
             });
         }
         (KeyCode::Char('x'), KeyModifiers::NONE) => {
-            if let Some(s) = app.sessions.get(app.selected) {
+            if let Some(s) = app.selected_session() {
                 let id = s.id.to_string();
                 match client::close_session_raw(id).await {
                     Ok(_) => {
@@ -445,8 +655,8 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
 }
 
 async fn attach_at_index(app: &mut App, idx: usize) {
-    let info = match app.sessions.get(idx) {
-        Some(s) => s.clone(),
+    let info = match app.visible_sessions().get(idx) {
+        Some(s) => (*s).clone(),
         None => return,
     };
     if info.status == "exited" {
@@ -467,15 +677,17 @@ async fn attach_at_index(app: &mut App, idx: usize) {
 }
 
 async fn attach_at_offset(app: &mut App, offset: isize) {
-    let n = app.sessions.len();
+    let visible = app.visible_sessions();
+    let n = visible.len();
     if n == 0 {
         return;
     }
     let cur_id = app.attached_session_id();
     let cur_idx = cur_id
-        .and_then(|id| app.sessions.iter().position(|s| s.id == id))
+        .and_then(|id| visible.iter().position(|s| s.id == id))
         .unwrap_or(0);
     let new_idx = ((cur_idx as isize + offset).rem_euclid(n as isize)) as usize;
+    drop(visible);
     attach_at_index(app, new_idx).await;
 }
 
@@ -639,7 +851,202 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
             *recent_selected,
             &app.recent_cwds,
         ),
+        Modal::Help => draw_help(f),
+        Modal::Rename { input, cursor, .. } => draw_rename(f, input, *cursor),
+        Modal::Details { session_id } => {
+            if let Some(s) = app.sessions.iter().find(|s| s.id == *session_id) {
+                draw_details(f, s);
+            } else {
+                draw_help(f);
+            }
+        }
     }
+}
+
+fn draw_help(f: &mut ratatui::Frame) {
+    let parent = f.area();
+    let w = 64.min(parent.width.saturating_sub(4));
+    let h = 30.min(parent.height.saturating_sub(2));
+    let area = centered_rect(w, h, parent);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(ratatui::text::Span::styled(
+            " keymap ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    use ratatui::text::{Line, Span};
+    let dim = Style::default().fg(Color::DarkGray);
+    let key = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let txt = Style::default().fg(Color::White);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sec = |label: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |k: &str, v: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled(format!("{:<14}", k), key),
+            Span::styled(v.to_string(), txt),
+        ])
+    };
+
+    lines.push(sec("dashboard"));
+    lines.push(row("hjkl / arrows", "navigate (j/k = down/up by row)"));
+    lines.push(row("enter", "attach to selected"));
+    lines.push(row("c", "new session (modal)"));
+    lines.push(row("r", "rename selected"));
+    lines.push(row("R", "restart (kill + resume)"));
+    lines.push(row("x", "close (forget) selected"));
+    lines.push(row("/", "filter sessions"));
+    lines.push(row("i", "details popup"));
+    lines.push(row("F5", "force refresh list"));
+    lines.push(row("?", "this help"));
+    lines.push(row("q", "quit (daemon stays alive)"));
+    lines.push(Line::from(""));
+    lines.push(sec("attached"));
+    lines.push(row("Ctrl-Space", "enter prefix mode"));
+    lines.push(row("prefix d", "detach"));
+    lines.push(row("prefix n / p", "next / previous session"));
+    lines.push(row("prefix 1..9", "jump to session N"));
+    lines.push(row("prefix q", "quit"));
+    lines.push(Line::from(""));
+    lines.push(sec("spawn form"));
+    lines.push(row("tab", "switch between cwd / flags"));
+    lines.push(row("↑/↓ in cwd", "cycle recent dirs"));
+    lines.push(row("Ctrl-Y", "toggle --dangerously-skip-permissions"));
+    lines.push(row("enter", "create"));
+    lines.push(row("esc", "cancel"));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  press any key to close",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height),
+    );
+}
+
+fn draw_rename(f: &mut ratatui::Frame, input: &str, cursor: usize) {
+    let parent = f.area();
+    let w = 60.min(parent.width.saturating_sub(4));
+    let h = 5;
+    let area = centered_rect(w, h, parent);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(ratatui::text::Span::styled(
+            " rename ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let row = Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1);
+    f.render_widget(
+        Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
+        row,
+    );
+    f.set_cursor_position(Position::new(row.x + cursor as u16, row.y));
+    f.render_widget(
+        Paragraph::new(" enter save  ·  esc cancel  ·  blank reverts to ai_title")
+            .style(Style::default().fg(Color::DarkGray)),
+        Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
+    );
+}
+
+fn draw_details(f: &mut ratatui::Frame, s: &SessionInfo) {
+    let parent = f.area();
+    let w = 80.min(parent.width.saturating_sub(4));
+    let h = 18.min(parent.height.saturating_sub(2));
+    let area = centered_rect(w, h, parent);
+    f.render_widget(Clear, area);
+    let color = status_color(&s.status);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(ratatui::text::Span::styled(
+            format!(" details — {} ", s.id),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    use ratatui::text::{Line, Span};
+    let label = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::White);
+    let mut lines: Vec<Line> = Vec::new();
+    let row = |k: &'static str, v: String| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {:<14}", k), label),
+            Span::styled(v, val),
+        ])
+    };
+
+    let title = s
+        .display_override
+        .clone()
+        .or_else(|| s.ai_title.clone())
+        .unwrap_or_else(|| s.name.clone());
+    lines.push(row("title", title));
+    lines.push(row("name", s.name.clone()));
+    lines.push(row("status", s.status.clone()));
+    if let Some(c) = s.exit_code {
+        lines.push(row("exit code", c.to_string()));
+    }
+    lines.push(row("cwd", s.cwd.clone()));
+    if let Some(m) = &s.model {
+        lines.push(row("model", m.clone()));
+    }
+    if let Some(t) = &s.current_tool {
+        lines.push(row("running tool", t.clone()));
+    }
+    lines.push(row("turns", s.turn_count.to_string()));
+    lines.push(row(
+        "tokens",
+        format!(
+            "input {}  ·  output {}  ·  cache {}",
+            compact_num(s.tokens_input),
+            compact_num(s.tokens_output),
+            compact_num(s.tokens_cache_read)
+        ),
+    ));
+    lines.push(row("started", format_time_ago(s.started_at_ms)));
+    lines.push(row("last seen", format_time_ago(s.last_activity_ms)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  last message",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", s.last_message.as_deref().unwrap_or("(none)")),
+        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  press any key to close",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    )));
+    let _ = color;
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect::new(inner.x, inner.y, inner.width, inner.height),
+    );
 }
 
 fn draw_spawn_form(
@@ -836,18 +1243,22 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
     );
 
-    if app.sessions.is_empty() {
-        draw_empty_state(f, chunks[1]);
-    } else {
-        let cols = draw_cards(f, &app.sessions, app.selected, app.tick_phase, chunks[1]);
-        // Stash the rendered grid width for j/k navigation. RefCell-free hack:
-        // we mutate via a raw pointer because draw is called with `&App`. This
-        // is a single-thread access from the render path, but cleaner long-term
-        // would be to compute cols in the event loop instead.
-        let app_ptr = app as *const App as *mut App;
-        unsafe {
-            (*app_ptr).grid_cols = cols;
+    let visible = app.visible_sessions();
+    if visible.is_empty() {
+        if app.filter.is_some() {
+            f.render_widget(
+                Paragraph::new("\n\n  no sessions match the filter\n  press esc to clear")
+                    .style(Style::default().fg(Color::DarkGray)),
+                chunks[1],
+            );
+        } else {
+            draw_empty_state(f, chunks[1]);
         }
+    } else {
+        let owned: Vec<SessionInfo> = visible.iter().map(|s| (*s).clone()).collect();
+        let cols = draw_cards(f, &owned, app.selected, app.tick_phase, chunks[1]);
+        let app_ptr = app as *const App as *mut App;
+        unsafe { (*app_ptr).grid_cols = cols; }
     }
 
     // Footer separator + help/status line
@@ -856,10 +1267,12 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         Paragraph::new("─".repeat(footer_w)).style(Style::default().fg(Color::DarkGray)),
         Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
     );
-    let status_text = if let Some((msg, _)) = &app.status_message {
+    let status_text = if let Some(filter) = app.filter.as_deref() {
+        format!(" / {filter}_  (esc clear · enter exit input)")
+    } else if let Some((msg, _)) = &app.status_message {
         format!(" {msg}")
     } else {
-        " hjkl/↑↓←→  move    enter  attach    c  new    x  close    r  refresh    q  quit"
+        " hjkl  move    enter  attach    c  new    r  rename    R  restart    x  close    /  filter    i  info    ?  help    q  quit"
             .to_string()
     };
     f.render_widget(

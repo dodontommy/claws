@@ -104,6 +104,24 @@ pub async fn close_session_raw(session_id: String) -> Result<()> {
     Ok(())
 }
 
+pub async fn rename_session_raw(session_id: uuid::Uuid, name: String) -> Result<()> {
+    let params = json!({"session_id": session_id.to_string(), "name": name});
+    let resp = call_with_autospawn("rename_session", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    Ok(())
+}
+
+pub async fn restart_session_raw(session_id: uuid::Uuid) -> Result<()> {
+    let params = json!({"session_id": session_id.to_string()});
+    let resp = call_with_autospawn("restart_session", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    Ok(())
+}
+
 pub async fn send_input_raw(session_id: uuid::Uuid, data: Vec<u8>) -> Result<()> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
     let params = json!({"session_id": session_id.to_string(), "data_b64": b64});

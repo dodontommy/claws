@@ -109,6 +109,9 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
         .await;
         match result {
             Ok(Ok(s)) => {
+                if let Some(name) = ps.display_override.clone() {
+                    s.set_display_override(Some(name));
+                }
                 tracing::info!(id = %s.id, cwd = %s.cwd.display(), "resumed");
                 reg.insert(s);
             }
@@ -192,6 +195,14 @@ async fn dispatch(
         },
         "resize_session" => match serde_json::from_value::<ResizeParams>(req.params.clone()) {
             Ok(p) => handle_resize(req.id, p, registry).await,
+            Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
+        },
+        "rename_session" => match serde_json::from_value::<RenameParams>(req.params.clone()) {
+            Ok(p) => handle_rename(req.id, p, registry, store).await,
+            Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
+        },
+        "restart_session" => match serde_json::from_value::<SessionIdParam>(req.params.clone()) {
+            Ok(p) => handle_restart(req.id, p, registry, store).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
         other => err(req.id, RpcError::method_not_found(other)),
@@ -324,6 +335,78 @@ async fn handle_close(
     }
 }
 
+async fn handle_rename(
+    id: u64,
+    p: RenameParams,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> Response {
+    let s = match reg.get(p.session_id) {
+        Some(s) => s,
+        None => return err(id, RpcError::session_not_found(p.session_id)),
+    };
+    let trimmed = p.name.trim();
+    let new = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+    s.set_display_override(new.clone());
+    if let Err(e) = store.set_display_override(p.session_id, new.as_deref()) {
+        tracing::warn!(error = %e, "could not persist rename");
+    }
+    ok(id, json!({"renamed": true}))
+}
+
+async fn handle_restart(
+    id: u64,
+    p: SessionIdParam,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> Response {
+    let old = match reg.remove(p.session_id) {
+        Some(s) => s,
+        None => return err(id, RpcError::session_not_found(p.session_id)),
+    };
+    let cwd = old.cwd.clone();
+    let name = old.name.clone();
+    let model = old.model_requested.clone();
+    let display_override = old.display_override();
+    // We need to re-load extra_args from the store (the live Session doesn't
+    // remember them — they're only used at spawn). Easier: just resume with no
+    // extra args. If the user wanted them, they're in the persisted row.
+    let extra_args: Vec<String> = store
+        .list_resumable()
+        .ok()
+        .and_then(|v| v.into_iter().find(|r| r.id == p.session_id))
+        .map(|r| r.extra_args)
+        .unwrap_or_default();
+
+    old.close();
+    // Brief pause so claude releases the JSONL lock before --resume.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let settings_path = match hook::write_settings_for(p.session_id) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "settings write on restart");
+            None
+        }
+    };
+    let session_id = p.session_id;
+    let result = tokio::task::spawn_blocking(move || {
+        spawn_session(session_id, cwd, Some(name), model, settings_path, SpawnMode::Resume, extra_args)
+    })
+    .await;
+    match result {
+        Ok(Ok(s)) => {
+            if let Some(name) = display_override {
+                s.set_display_override(Some(name));
+            }
+            reg.insert(s);
+            ok(id, json!({"restarted": true}))
+        }
+        Ok(Err(e)) => err(id, RpcError::internal(format!("restart spawn failed: {e:#}"))),
+        Err(e) => err(id, RpcError::internal(format!("restart join failed: {e}"))),
+    }
+}
+
 async fn handle_resize(id: u64, p: ResizeParams, reg: &SessionRegistry) -> Response {
     match reg.get(p.session_id) {
         Some(s) => match s.resize(p.rows, p.cols) {
@@ -366,6 +449,7 @@ fn session_info(s: &Session) -> SessionInfo {
         tokens_input: snap.tokens_input,
         tokens_output: snap.tokens_output,
         tokens_cache_read: snap.tokens_cache_read,
+        display_override: s.display_override(),
     }
 }
 

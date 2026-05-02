@@ -49,6 +49,7 @@ pub struct Session {
     pub started_at: SystemTime,
     pub model_requested: Option<String>,
     state: Arc<Mutex<SessionRuntime>>,
+    display_override: Mutex<Option<String>>,
 }
 
 pub struct SessionSnapshot {
@@ -180,6 +181,7 @@ pub fn spawn_session(
         started_at: SystemTime::now(),
         model_requested: model,
         state: runtime,
+        display_override: Mutex::new(None),
     })
 }
 
@@ -396,6 +398,14 @@ impl Session {
         if let Some(tx) = s.kill_tx.take() {
             let _ = tx.send(());
         }
+    }
+
+    pub fn display_override(&self) -> Option<String> {
+        self.display_override.lock().unwrap().clone()
+    }
+
+    pub fn set_display_override(&self, name: Option<String>) {
+        *self.display_override.lock().unwrap() = name;
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {

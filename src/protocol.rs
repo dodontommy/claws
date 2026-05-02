@@ -96,6 +96,16 @@ pub struct SessionInfo {
     pub tokens_input: u64,
     pub tokens_output: u64,
     pub tokens_cache_read: u64,
+
+    /// User-set display name (via `r` rename). Wins over ai_title and name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_override: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenameParams {
+    pub session_id: Uuid,
+    pub name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -18,6 +18,7 @@ pub struct PersistedSession {
     pub model: Option<String>,
     pub started_at_ms: u128,
     pub extra_args: Vec<String>,
+    pub display_override: Option<String>,
 }
 
 impl Store {
@@ -38,8 +39,9 @@ impl Store {
                 closed_by_user INTEGER NOT NULL DEFAULT 0
             );",
         )?;
-        // Idempotent migration: add extra_args column if missing.
+        // Idempotent migrations.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN extra_args TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN display_override TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -74,10 +76,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_display_override(&self, id: Uuid, name: Option<&str>) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE sessions SET display_override = ?1 WHERE id = ?2",
+            params![name, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_resumable(&self) -> Result<Vec<PersistedSession>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT id, cwd, name, model, started_at_ms, extra_args FROM sessions
+            "SELECT id, cwd, name, model, started_at_ms, extra_args, display_override FROM sessions
              WHERE closed_by_user = 0
              ORDER BY started_at_ms ASC",
         )?;
@@ -95,6 +106,7 @@ impl Store {
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
+            let display_override: Option<String> = row.get(6).ok();
             Ok(PersistedSession {
                 id,
                 cwd: PathBuf::from(row.get::<_, String>(1)?),
@@ -102,6 +114,7 @@ impl Store {
                 model: row.get(3)?,
                 started_at_ms: row.get::<_, i64>(4)? as u128,
                 extra_args,
+                display_override,
             })
         })?;
         let mut out = Vec::new();
