@@ -10,9 +10,10 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io::Stdout;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -44,6 +45,14 @@ enum View {
     },
 }
 
+enum Modal {
+    CwdPicker {
+        input: String,
+        cursor: usize,
+        recent_selected: usize,
+    },
+}
+
 struct App {
     sessions: Vec<SessionInfo>,
     selected: usize,
@@ -51,10 +60,19 @@ struct App {
     quit: bool,
     view: View,
     tick_phase: u32,
+    modal: Option<Modal>,
+    recent_cwds: Vec<String>,
 }
 
 impl App {
     fn new() -> Self {
+        let pwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut recent = Vec::new();
+        if !pwd.is_empty() {
+            recent.push(pwd);
+        }
         Self {
             sessions: vec![],
             selected: 0,
@@ -62,6 +80,16 @@ impl App {
             quit: false,
             view: View::Dashboard,
             tick_phase: 0,
+            modal: None,
+            recent_cwds: recent,
+        }
+    }
+
+    fn push_recent_cwd(&mut self, cwd: String) {
+        self.recent_cwds.retain(|c| c != &cwd);
+        self.recent_cwds.insert(0, cwd);
+        if self.recent_cwds.len() > 20 {
+            self.recent_cwds.truncate(20);
         }
     }
 
@@ -158,7 +186,14 @@ async fn tick_work(app: &mut App) {
 
 async fn refresh_sessions(app: &mut App) {
     match client::list_sessions_raw().await {
-        Ok(list) => {
+        Ok(mut list) => {
+            // Sort: needs-you first, then streaming, then idle by recent activity,
+            // spawning, exited last. Within a status bucket, most-recent first.
+            list.sort_by(|a, b| {
+                sort_priority(&a.status)
+                    .cmp(&sort_priority(&b.status))
+                    .then_with(|| b.last_activity_ms.cmp(&a.last_activity_ms))
+            });
             app.sessions = list;
             if !app.sessions.is_empty() && app.selected >= app.sessions.len() {
                 app.selected = app.sessions.len() - 1;
@@ -168,10 +203,110 @@ async fn refresh_sessions(app: &mut App) {
     }
 }
 
+fn sort_priority(status: &str) -> u8 {
+    match status {
+        "awaiting_permission" => 0,
+        "streaming" => 1,
+        "idle" => 2,
+        "spawning" => 3,
+        "exited" => 4,
+        _ => 5,
+    }
+}
+
 async fn handle_key(key: KeyEvent, app: &mut App) {
+    if app.modal.is_some() {
+        handle_modal_key(key, app).await;
+        return;
+    }
     match &mut app.view {
         View::Dashboard => handle_dashboard_key(key, app).await,
         View::Attached { .. } => handle_attached_key(key, app).await,
+    }
+}
+
+async fn handle_modal_key(key: KeyEvent, app: &mut App) {
+    let modal = match app.modal.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    match modal {
+        Modal::CwdPicker {
+            input,
+            cursor,
+            recent_selected,
+        } => match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => app.modal = None,
+            (KeyCode::Enter, _) => {
+                let cwd = input.trim().to_string();
+                if cwd.is_empty() {
+                    app.set_status("cwd is empty".into());
+                    return;
+                }
+                if !PathBuf::from(&cwd).is_dir() {
+                    app.set_status(format!("not a directory: {cwd}"));
+                    return;
+                }
+                app.modal = None;
+                match client::create_session_raw(cwd.clone(), None, None).await {
+                    Ok(_) => {
+                        app.push_recent_cwd(cwd);
+                        app.set_status("session created".into());
+                        refresh_sessions(app).await;
+                    }
+                    Err(e) => app.set_status(format!("create failed: {e}")),
+                }
+            }
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                input.insert(*cursor, c);
+                *cursor += c.len_utf8();
+            }
+            (KeyCode::Backspace, _) => {
+                if *cursor > 0 {
+                    let mut new = String::new();
+                    let mut taken = 0;
+                    let target = *cursor;
+                    let mut last_char_len = 0;
+                    for ch in input.chars() {
+                        let len = ch.len_utf8();
+                        if taken + len == target {
+                            last_char_len = len;
+                            break;
+                        }
+                        new.push(ch);
+                        taken += len;
+                    }
+                    let mut after = String::new();
+                    let mut idx = 0;
+                    for ch in input.chars() {
+                        let len = ch.len_utf8();
+                        idx += len;
+                        if idx > target {
+                            after.push(ch);
+                        }
+                    }
+                    *input = new + &after;
+                    *cursor -= last_char_len;
+                }
+            }
+            (KeyCode::Up, _) => {
+                if *recent_selected > 0 {
+                    *recent_selected -= 1;
+                }
+            }
+            (KeyCode::Down, _) => {
+                if *recent_selected + 1 < app.recent_cwds.len() {
+                    *recent_selected += 1;
+                }
+            }
+            (KeyCode::Tab, _) => {
+                if let Some(pick) = app.recent_cwds.get(*recent_selected) {
+                    *input = pick.clone();
+                    *cursor = input.len();
+                }
+            }
+            _ => {}
+        },
     }
 }
 
@@ -186,20 +321,15 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
             app.set_status("refreshed".into());
         }
         (KeyCode::Char('c'), KeyModifiers::NONE) => {
-            let cwd = match std::env::current_dir() {
-                Ok(p) => p.to_string_lossy().into_owned(),
-                Err(e) => {
-                    app.set_status(format!("cwd error: {e}"));
-                    return;
-                }
-            };
-            match client::create_session_raw(cwd, None, None).await {
-                Ok(_) => {
-                    app.set_status("session created".into());
-                    refresh_sessions(app).await;
-                }
-                Err(e) => app.set_status(format!("create failed: {e}")),
-            }
+            let pwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let cursor = pwd.len();
+            app.modal = Some(Modal::CwdPicker {
+                input: pwd,
+                cursor,
+                recent_selected: 0,
+            });
         }
         (KeyCode::Char('x'), KeyModifiers::NONE) => {
             if let Some(s) = app.sessions.get(app.selected) {
@@ -214,25 +344,45 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
             }
         }
         (KeyCode::Enter, KeyModifiers::NONE) => {
-            if let Some(s) = app.sessions.get(app.selected) {
-                if s.status != "exited" {
-                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                    let pane_rows = rows.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
-                    let pane_cols = cols.max(1);
-                    let _ = client::resize_session_raw(s.id, pane_rows, pane_cols).await;
-                    app.view = View::Attached {
-                        session_id: s.id,
-                        parser: vt100::Parser::new(pane_rows, pane_cols, 0),
-                        read_seq: 0,
-                        prefix_active: false,
-                    };
-                } else {
-                    app.set_status("session exited; can't attach".into());
-                }
-            }
+            attach_at_index(app, app.selected).await;
         }
         _ => {}
     }
+}
+
+async fn attach_at_index(app: &mut App, idx: usize) {
+    let info = match app.sessions.get(idx) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    if info.status == "exited" {
+        app.set_status("session exited; can't attach".into());
+        return;
+    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let pane_rows = rows.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
+    let pane_cols = cols.max(1);
+    let _ = client::resize_session_raw(info.id, pane_rows, pane_cols).await;
+    app.view = View::Attached {
+        session_id: info.id,
+        parser: vt100::Parser::new(pane_rows, pane_cols, 0),
+        read_seq: 0,
+        prefix_active: false,
+    };
+    app.selected = idx;
+}
+
+async fn attach_at_offset(app: &mut App, offset: isize) {
+    let n = app.sessions.len();
+    if n == 0 {
+        return;
+    }
+    let cur_id = app.attached_session_id();
+    let cur_idx = cur_id
+        .and_then(|id| app.sessions.iter().position(|s| s.id == id))
+        .unwrap_or(0);
+    let new_idx = ((cur_idx as isize + offset).rem_euclid(n as isize)) as usize;
+    attach_at_index(app, new_idx).await;
 }
 
 async fn handle_attached_key(key: KeyEvent, app: &mut App) {
@@ -267,8 +417,21 @@ async fn handle_attached_key(key: KeyEvent, app: &mut App) {
                 app.quit = true;
                 return;
             }
+            (KeyCode::Char('n'), _) => {
+                attach_at_offset(app, 1).await;
+                return;
+            }
+            (KeyCode::Char('p'), _) => {
+                attach_at_offset(app, -1).await;
+                return;
+            }
+            (KeyCode::Char(c), _) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c.to_digit(10).unwrap() as usize) - 1;
+                attach_at_index(app, idx).await;
+                return;
+            }
             (KeyCode::Char('?'), _) => {
-                app.set_status("prefix: d=detach q=quit (more in v0.7)".into());
+                app.set_status("prefix: d=detach n/p=cycle 1-9=jump q=quit".into());
             }
             (KeyCode::Char(' '), m) if m.contains(KeyModifiers::CONTROL) => {
                 // Literal Ctrl-Space passthrough
@@ -358,6 +521,119 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         View::Dashboard => draw_dashboard(f, app),
         View::Attached { .. } => draw_attached(f, app),
     }
+    if let Some(modal) = &app.modal {
+        draw_modal(f, modal, app);
+    }
+}
+
+fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
+    match modal {
+        Modal::CwdPicker {
+            input,
+            cursor,
+            recent_selected,
+        } => draw_cwd_picker(f, input, *cursor, *recent_selected, &app.recent_cwds),
+    }
+}
+
+fn draw_cwd_picker(
+    f: &mut ratatui::Frame,
+    input: &str,
+    cursor: usize,
+    recent_selected: usize,
+    recent: &[String],
+) {
+    let parent = f.area();
+    let w = 70.min(parent.width.saturating_sub(4));
+    let recent_rows = recent.len().min(8) as u16;
+    let h = 6 + recent_rows;
+    let area = centered_rect(w, h, parent);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(ratatui::text::Span::styled(
+            " spawn session ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // label
+            Constraint::Length(1), // input
+            Constraint::Length(1), // separator
+            Constraint::Length(1), // recent label
+            Constraint::Min(0),    // recent list
+            Constraint::Length(1), // help
+        ])
+        .split(Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        ));
+
+    f.render_widget(
+        Paragraph::new("cwd").style(Style::default().fg(Color::DarkGray)),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
+        chunks[1],
+    );
+    f.set_cursor_position(Position::new(
+        chunks[1].x + cursor as u16,
+        chunks[1].y,
+    ));
+
+    f.render_widget(
+        Paragraph::new("─".repeat(chunks[2].width as usize))
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+    f.render_widget(
+        Paragraph::new("recent").style(Style::default().fg(Color::DarkGray)),
+        chunks[3],
+    );
+
+    let visible = recent.iter().take(8).enumerate();
+    for (i, dir) in visible {
+        let y = chunks[4].y + i as u16;
+        if y >= chunks[4].y + chunks[4].height {
+            break;
+        }
+        let marker = if i == recent_selected { "› " } else { "  " };
+        let style = if i == recent_selected {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let avail = chunks[4].width.saturating_sub(2) as usize;
+        let line = format!("{marker}{}", truncate_ellipsis(&shorten_home(dir), avail));
+        f.render_widget(
+            Paragraph::new(line).style(style),
+            Rect::new(chunks[4].x, y, chunks[4].width, 1),
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(" enter create   ·   tab fill from recent   ·   ↑/↓ pick   ·   esc cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[5],
+    );
+}
+
+fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
 }
 
 fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
@@ -481,11 +757,22 @@ fn draw_cards(
 }
 
 fn status_color(status: &str) -> Color {
+    status_color_pulsed(status, 0)
+}
+
+fn status_color_pulsed(status: &str, tick_phase: u32) -> Color {
     match status {
         "spawning" => Color::DarkGray,
         "idle" => Color::Green,
         "streaming" => Color::Yellow,
-        "awaiting_permission" => Color::LightMagenta,
+        "awaiting_permission" => {
+            // Pulse between bright and dimmer magenta every ~250ms (5 ticks).
+            if (tick_phase / 5) % 2 == 0 {
+                Color::LightMagenta
+            } else {
+                Color::Magenta
+            }
+        }
         "exited" => Color::DarkGray,
         _ => Color::White,
     }
@@ -512,7 +799,7 @@ fn draw_card(
     tick_phase: u32,
     area: Rect,
 ) {
-    let color = status_color(&s.status);
+    let color = status_color_pulsed(&s.status, tick_phase);
     let border_type = if selected { BorderType::Double } else { BorderType::Plain };
     let border_style = if selected {
         Style::default().fg(color).add_modifier(Modifier::BOLD)

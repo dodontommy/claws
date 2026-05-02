@@ -65,7 +65,7 @@ pub struct CreateSessionParams {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: Uuid,
     pub name: String,
