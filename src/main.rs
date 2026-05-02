@@ -65,8 +65,13 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    // Daemon (foreground) logs to stderr; everyone else logs to file so TUI
+    // and hook-emit don't trample the user's terminal.
+    let to_stderr = matches!(cli.command, Some(Command::Daemon))
+        || std::env::var("CLAWS_LOG_STDERR").is_ok();
+    init_tracing(to_stderr);
+    install_panic_hook();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -99,8 +104,44 @@ fn main() -> Result<()> {
     })
 }
 
-fn init_tracing() {
+fn init_tracing(to_stderr: bool) {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Silence vt100's per-frame "unhandled" debug spam — those are about
+    // Claude's terminal features (kitty keyboard, focus events, synchronized
+    // updates) that we don't need to handle and the screen renders fine without.
+    let default = "info,vt100=warn";
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+
+    if to_stderr {
+        fmt().with_env_filter(filter).with_target(false).init();
+        return;
+    }
+    if let Ok(path) = paths::log_file() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let writer = std::sync::Mutex::new(file);
+            fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(writer)
+                .init();
+            return;
+        }
+    }
+    // Final fallback if file open fails: stderr.
     fmt().with_env_filter(filter).with_target(false).init();
+}
+
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort: leave alt screen and disable raw mode before the
+        // panic message hits stderr, so the user's terminal isn't wedged.
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        original(info);
+    }));
 }

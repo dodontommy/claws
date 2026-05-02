@@ -219,7 +219,12 @@ async fn handle_read_output(id: u64, p: ReadOutputParams, reg: &SessionRegistry)
 }
 
 async fn handle_close(id: u64, p: SessionIdParam, reg: &SessionRegistry) -> Response {
-    match reg.get(p.session_id) {
+    // Remove from registry immediately, then send kill. Reader/waiter threads
+    // each hold their own Arc<SessionRuntime>, so the underlying state stays
+    // alive until they finish — no leak. The session simply disappears from
+    // future list_sessions calls right away, which matches the user's mental
+    // model of "I closed it, why is it still here?".
+    match reg.remove(p.session_id) {
         Some(s) => {
             s.close();
             ok(id, json!({"closed": true}))
