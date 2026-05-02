@@ -1062,7 +1062,11 @@ fn draw_spawn_form(
     let parent = f.area();
     let w = 80.min(parent.width.saturating_sub(4));
     let recent_rows = recent.len().min(6) as u16;
-    let h = 10 + recent_rows;
+    // 9 fixed rows (label/input/gap/label/input/examples/sep/label/help) +
+    // recent_rows + 2 for borders. Previously omitted the +2, so ratatui
+    // collapsed the args-input row to zero height — typed text was rendering
+    // behind the examples line.
+    let h = 11 + recent_rows;
     let area = centered_rect(w, h, parent);
 
     f.render_widget(Clear, area);
