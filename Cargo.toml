@@ -1,14 +1,15 @@
-[workspace]
-resolver = "2"
-members = ["."]
-exclude = ["spike-pty"]
-
 [package]
 name = "claws"
 version = "0.1.0"
 edition = "2021"
 description = "TUI multiplexer for Claude Code sessions"
-publish = false
+repository = "https://github.com/dodontommy/multi-claude"
+homepage = "https://github.com/dodontommy/multi-claude"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "claws"
@@ -41,3 +42,8 @@ libc = "0.2"
 opt-level = 0
 debug = 1
 incremental = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
