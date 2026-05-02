@@ -74,6 +74,11 @@ struct SessionRuntime {
     writer: Box<dyn std::io::Write + Send>,
     kill_tx: Option<mpsc::Sender<()>>,
 
+    /// Daemon-side vt100 parser fed from the same reader as the ring buffer.
+    /// Used to extract Claude's status-bar info (context %, cost, reset time)
+    /// that aren't reported via the JSONL transcript.
+    parser: vt100::Parser,
+
     current_tool: Option<String>,
     last_message: Option<String>,
     ai_title: Option<String>,
@@ -82,6 +87,13 @@ struct SessionRuntime {
     tokens_input: u64,
     tokens_output: u64,
     tokens_cache_read: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextStatus {
+    pub pct: u8,
+    pub used: String,
+    pub total: String,
 }
 
 const RING_CAP: usize = 1024 * 1024;
@@ -151,6 +163,7 @@ pub fn spawn_session(
         _master: pair.master,
         writer,
         kill_tx: Some(kill_tx),
+        parser: vt100::Parser::new(24, 80, 0),
         current_tool: None,
         last_message: None,
         ai_title: None,
@@ -196,6 +209,7 @@ fn pty_reader_loop(
             Ok(n) => {
                 let mut s = runtime.lock().unwrap();
                 s.ring.append(&buf[..n]);
+                s.parser.process(&buf[..n]);
                 s.last_activity = SystemTime::now();
             }
             Err(e) => {
@@ -323,6 +337,40 @@ fn drain_and_process(
     Ok(())
 }
 
+fn parse_context_from_line(line: &str) -> Option<ContextStatus> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for i in 0..tokens.len() {
+        let t = tokens[i];
+        let pct_str = match t.strip_suffix('%') {
+            Some(p) => p,
+            None => continue,
+        };
+        let pct: u8 = match pct_str.parse() {
+            Ok(p) if p <= 100 => p,
+            _ => continue,
+        };
+        let next = match tokens.get(i + 1) {
+            Some(n) => n,
+            None => continue,
+        };
+        let (used, total) = match next.split_once('/') {
+            Some(t) => t,
+            None => continue,
+        };
+        // Sanity: total must contain at least one digit (filters out "v100%"
+        // false positives where the next token is something unrelated).
+        if !total.chars().any(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        return Some(ContextStatus {
+            pct,
+            used: used.to_string(),
+            total: total.to_string(),
+        });
+    }
+    None
+}
+
 fn process_jsonl_line(runtime: &Arc<Mutex<SessionRuntime>>, line: &str) {
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -409,11 +457,39 @@ impl Session {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
-        let s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
         s._master
             .resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| anyhow::anyhow!("pty resize failed: {e}"))?;
+        s.parser.set_size(rows, cols);
         Ok(())
+    }
+
+    /// Scrape the daemon-side vt100 screen for Claude's context-fill status,
+    /// which appears in its bottom status bar as e.g. `12% 120k/1.0M`. Not
+    /// available in the JSONL or hooks — only on screen.
+    pub fn context_status(&self) -> Option<ContextStatus> {
+        let s = self.state.lock().unwrap();
+        let screen = s.parser.screen();
+        let (rows, cols) = screen.size();
+        // Walk bottom-up; the status bar is at the bottom of Claude's UI.
+        for r in (0..rows).rev() {
+            let mut line = String::new();
+            for c in 0..cols {
+                if let Some(cell) = screen.cell(r, c) {
+                    let contents = cell.contents();
+                    if contents.is_empty() {
+                        line.push(' ');
+                    } else {
+                        line.push_str(&contents);
+                    }
+                }
+            }
+            if let Some(ctx) = parse_context_from_line(&line) {
+                return Some(ctx);
+            }
+        }
+        None
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {

@@ -433,6 +433,7 @@ async fn handle_hook_event(id: u64, p: HookEventParams, reg: &SessionRegistry) -
 
 fn session_info(s: &Session) -> SessionInfo {
     let snap = s.snapshot();
+    let ctx = s.context_status();
     SessionInfo {
         id: s.id,
         name: s.name.clone(),
@@ -450,6 +451,9 @@ fn session_info(s: &Session) -> SessionInfo {
         tokens_output: snap.tokens_output,
         tokens_cache_read: snap.tokens_cache_read,
         display_override: s.display_override(),
+        context_pct: ctx.as_ref().map(|c| c.pct),
+        context_used: ctx.as_ref().map(|c| c.used.clone()),
+        context_total: ctx.map(|c| c.total),
     }
 }
 

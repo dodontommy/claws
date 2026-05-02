@@ -1529,6 +1529,24 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionInfo, tick_phase: u32, area: R
             Style::default().fg(Color::Cyan),
         ));
     }
+    if let Some(pct) = s.context_pct {
+        let bar = context_bar(pct, 20);
+        let used = s.context_used.as_deref().unwrap_or("?");
+        let total = s.context_total.as_deref().unwrap_or("?");
+        let bar_color = match pct {
+            0..=59 => Color::Green,
+            60..=84 => Color::Yellow,
+            _ => Color::Red,
+        };
+        info_lines.push(Line::from(vec![
+            Span::styled(format!("{:<10}", "context"), label),
+            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::styled(
+                format!("  {pct}%  ·  {used}/{total}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
     let info_h = info_lines.len() as u16;
     f.render_widget(
         Paragraph::new(info_lines),
@@ -1814,15 +1832,22 @@ fn estimate_cost(model: &str, info: &SessionInfo) -> f64 {
 }
 
 fn format_cost(c: f64) -> String {
-    if c < 0.0005 {
-        "$0.00".to_string()
-    } else if c < 0.01 {
-        format!("${c:.4}")
-    } else if c < 1.0 {
-        format!("${c:.3}")
-    } else {
-        format!("${c:.2}")
+    format!("${c:.2}")
+}
+
+/// Render a 1-row unicode bar of `width` cells filled to `pct`%.
+fn context_bar(pct: u8, width: usize) -> String {
+    let pct = pct.min(100) as usize;
+    let filled = (pct * width + 50) / 100;
+    let empty = width.saturating_sub(filled);
+    let mut s = String::with_capacity(width * 3);
+    for _ in 0..filled {
+        s.push('█');
     }
+    for _ in 0..empty {
+        s.push('░');
+    }
+    s
 }
 
 fn display_status(s: &str) -> &'static str {

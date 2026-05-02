@@ -100,6 +100,15 @@ pub struct SessionInfo {
     /// User-set display name (via `r` rename). Wins over ai_title and name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_override: Option<String>,
+
+    // Context-window fill, scraped from Claude's status bar (no JSONL/API
+    // exposure). All three Some/None together.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_pct: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_used: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_total: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
