@@ -611,6 +611,10 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
         }
         (KeyCode::Char('?'), _) => app.modal = Some(Modal::Help),
+        (KeyCode::Char('t'), KeyModifiers::NONE) => {
+            let t = crate::theme::cycle();
+            app.set_status(format!("theme: {}", t.label));
+        }
         (KeyCode::Char('/'), _) => {
             app.filter = Some(String::new());
             app.filter_cursor = 0;
@@ -1017,6 +1021,7 @@ fn draw_help(f: &mut ratatui::Frame) {
     lines.push(row("/", "filter sessions"));
     lines.push(row("i", "session details popup"));
     lines.push(row("F5", "force refresh"));
+    lines.push(row("t", "cycle color theme"));
     lines.push(row("?", "this help"));
     lines.push(row("q", "quit TUI  (daemon and sessions stay alive)"));
 
@@ -1429,7 +1434,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     } else if let Some((msg, _)) = &app.status_message {
         format!(" {msg}")
     } else {
-        " hjkl  move    enter  attach    c  new    r  rename    R  restart    x  close    /  filter    i  info    ?  help    q  quit"
+        " hjkl  move    enter  attach    c  new    r  rename    R  restart    x  close    /  filter    i  info    t  theme    ?  help    q  quit"
             .to_string()
     };
     f.render_widget(
@@ -1439,32 +1444,75 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
 }
 
 fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
-    let lines = vec![
-        "".to_string(),
-        "".to_string(),
-        "◌".to_string(),
-        "".to_string(),
-        "no sessions yet".to_string(),
-        "".to_string(),
-        "press  c  to create one here".to_string(),
+    let theme = crate::theme::current();
+
+    let crab = [
+        "      ▟▙       ▟▙       ",
+        "      ██▄▄▄▄▄▄▄██       ",
+        "    ▟████ ◉   ◉ ████▙   ",
+        "  ▟████████▀▀▀████████▙ ",
+        "  ▔▀██▀▔ ▀▀▀▀▀▀▀ ▔▀██▔▀ ",
+        "    ▘▝     ▔▔▔     ▝▘   ",
     ];
-    let h = lines.len() as u16;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    for (i, line) in lines.iter().enumerate() {
+    let wordmark = [
+        "                                          ",
+        "    ▄████▖ ██       █████  ▄    ▄ ▄████▖  ",
+        "   ██      ██      ██   ██ ██  ██ ██      ",
+        "   ██      ██      ███████ ██  ██ ▀████▖  ",
+        "   ██      ██      ██   ██ ██▙▟██     ██  ",
+        "    ▀████▘ ▝█████▘ ██   ██  ▝██▘  ▝████▘  ",
+        "                                          ",
+    ];
+    let tagline = "many claws, one terminal";
+    let prompt = "press  c  to spawn a session   ·   ?  for help";
+
+    // Total block height: crab + 1 gap + wordmark + 1 gap + tagline + 1 gap + prompt.
+    let total_h = (crab.len() + 1 + wordmark.len() + 1 + 1 + 1 + 1) as u16;
+    let block_w = wordmark[0].chars().count().max(crab[0].chars().count()) as u16;
+
+    let y0 = area.y + area.height.saturating_sub(total_h) / 2;
+    let x0 = area.x + area.width.saturating_sub(block_w) / 2;
+
+    let mut row = 0u16;
+    for line in &crab {
         let w = line.chars().count() as u16;
-        let x = area.x + area.width.saturating_sub(w) / 2;
-        let style = match i {
-            2 => Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-            4 => Style::default().fg(Color::Gray),
-            _ => Style::default().fg(Color::DarkGray),
-        };
+        let x = x0 + (block_w.saturating_sub(w)) / 2;
         f.render_widget(
-            Paragraph::new(line.clone()).style(style),
-            Rect::new(x, y + i as u16, w, 1),
+            Paragraph::new(line.to_string())
+                .style(Style::default().fg(theme.awaiting_a)),
+            Rect::new(x, y0 + row, w, 1),
         );
+        row += 1;
     }
+    row += 1;
+
+    for line in &wordmark {
+        let w = line.chars().count() as u16;
+        let x = x0 + (block_w.saturating_sub(w)) / 2;
+        f.render_widget(
+            Paragraph::new(line.to_string())
+                .style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Rect::new(x, y0 + row, w, 1),
+        );
+        row += 1;
+    }
+    row += 1;
+
+    let tag_w = tagline.chars().count() as u16;
+    let tag_x = x0 + (block_w.saturating_sub(tag_w)) / 2;
+    f.render_widget(
+        Paragraph::new(tagline.to_string())
+            .style(Style::default().fg(theme.title_fallback).add_modifier(Modifier::ITALIC)),
+        Rect::new(tag_x, y0 + row, tag_w, 1),
+    );
+    row += 2;
+
+    let prompt_w = prompt.chars().count() as u16;
+    let prompt_x = x0 + (block_w.saturating_sub(prompt_w)) / 2;
+    f.render_widget(
+        Paragraph::new(prompt.to_string()).style(Style::default().fg(theme.dim)),
+        Rect::new(prompt_x, y0 + row, prompt_w, 1),
+    );
 }
 
 // Sidebar (left) / detail (right) split layout.
@@ -1765,20 +1813,20 @@ fn status_color(status: &str) -> Color {
 }
 
 fn status_color_pulsed(status: &str, tick_phase: u32) -> Color {
+    let t = crate::theme::current();
     match status {
-        "spawning" => Color::DarkGray,
-        "idle" => Color::Green,
-        "streaming" => Color::Yellow,
+        "spawning" => t.spawning,
+        "idle" => t.idle,
+        "streaming" => t.working,
         "awaiting_permission" => {
-            // Pulse between bright and dimmer magenta every ~250ms (5 ticks).
             if (tick_phase / 5) % 2 == 0 {
-                Color::LightMagenta
+                t.awaiting_a
             } else {
-                Color::Magenta
+                t.awaiting_b
             }
         }
-        "exited" => Color::DarkGray,
-        _ => Color::White,
+        "exited" => t.exited,
+        _ => t.title,
     }
 }
 

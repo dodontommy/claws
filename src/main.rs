@@ -12,6 +12,7 @@ mod registry;
 mod ring;
 mod session;
 mod spawn;
+mod theme;
 mod tui;
 
 #[derive(Parser)]
@@ -83,7 +84,10 @@ fn main() -> Result<()> {
     runtime.block_on(async {
         match cli.command {
             Some(Command::Daemon) => daemon::run().await,
-            None => tui::run().await,
+            None => {
+                theme::load();
+                tui::run().await
+            },
             Some(Command::Ping) => client::ping().await,
             Some(Command::KillServer) => client::kill_server().await,
             Some(Command::Logs) => {
