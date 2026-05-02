@@ -401,7 +401,10 @@ fn process_jsonl_line(runtime: &Arc<Mutex<SessionRuntime>>, line: &str) {
                     .collect();
                 let joined = texts.join(" ");
                 if !joined.is_empty() {
-                    s.last_message = Some(joined.chars().take(200).collect());
+                    // Keep up to ~2000 chars so the detail pane can show the
+                    // full message on a tall terminal. The TUI truncates with
+                    // an ellipsis if it doesn't fit anyway.
+                    s.last_message = Some(joined.chars().take(2000).collect());
                 }
             }
             if let Some(model) = msg.and_then(|m| m.get("model")).and_then(|m| m.as_str()) {

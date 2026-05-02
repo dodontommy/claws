@@ -1585,13 +1585,18 @@ fn draw_detail(f: &mut ratatui::Frame, s: &SessionInfo, tick_phase: u32, area: R
         } else {
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
         };
-        let msg_h = (pad.height.saturating_sub(msg_y - pad.y + 1)).min(6).max(1);
-        if msg_y + 1 < pad.y + pad.height {
+        // Use all rows between the label and the bottom-anchored stats line,
+        // minus one for a visual breathing gap. The stats render after this so
+        // any wrap-overflow into the last row is overwritten cleanly.
+        let msg_top = msg_y + 1;
+        let bottom = pad.y + pad.height;
+        let msg_h = bottom.saturating_sub(msg_top + 2).max(1);
+        if msg_top < bottom {
             f.render_widget(
                 Paragraph::new(format!("  {msg_text}"))
                     .style(msg_style)
                     .wrap(Wrap { trim: false }),
-                Rect::new(pad.x, msg_y + 1, pad.width, msg_h),
+                Rect::new(pad.x, msg_top, pad.width, msg_h),
             );
         }
     }
