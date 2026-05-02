@@ -6,6 +6,7 @@ mod client;
 mod daemon;
 mod hook;
 mod paths;
+mod persist;
 mod protocol;
 mod registry;
 mod ring;

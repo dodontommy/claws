@@ -1,8 +1,9 @@
 use crate::hook;
 use crate::paths;
+use crate::persist::Store;
 use crate::protocol::*;
 use crate::registry::SessionRegistry;
-use crate::session::{spawn_session, Session};
+use crate::session::{spawn_session, Session, SpawnMode};
 use anyhow::{Context, Result};
 use base64::Engine;
 use interprocess::local_socket::tokio::prelude::*;
@@ -34,6 +35,9 @@ pub async fn run() -> Result<()> {
 
     let shutdown = Arc::new(Notify::new());
     let registry = SessionRegistry::new();
+    let store = Store::open()?;
+
+    auto_resume(&store, &registry).await;
 
     loop {
         tokio::select! {
@@ -48,8 +52,9 @@ pub async fn run() -> Result<()> {
                     Ok(stream) => {
                         let sd = shutdown.clone();
                         let reg = registry.clone();
+                        let st = store.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, reg, sd).await {
+                            if let Err(e) = handle_client(stream, reg, st, sd).await {
                                 tracing::warn!(error = %e, "client connection closed");
                             }
                         });
@@ -69,9 +74,57 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+async fn auto_resume(store: &Store, reg: &SessionRegistry) {
+    let to_resume = match store.list_resumable() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list resumable sessions");
+            return;
+        }
+    };
+    if to_resume.is_empty() {
+        return;
+    }
+    tracing::info!(count = to_resume.len(), "resuming sessions");
+    for ps in to_resume {
+        if !ps.cwd.is_dir() {
+            tracing::warn!(id = %ps.id, cwd = %ps.cwd.display(), "skipping resume: cwd missing");
+            continue;
+        }
+        let settings_path = match hook::write_settings_for(ps.id) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to write hook settings on resume");
+                None
+            }
+        };
+        let id = ps.id;
+        let cwd = ps.cwd.clone();
+        let name = Some(ps.name.clone());
+        let model = ps.model.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            spawn_session(id, cwd, name, model, settings_path, SpawnMode::Resume)
+        })
+        .await;
+        match result {
+            Ok(Ok(s)) => {
+                tracing::info!(id = %s.id, cwd = %s.cwd.display(), "resumed");
+                reg.insert(s);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(id = %ps.id, error = ?e, "resume failed");
+            }
+            Err(e) => {
+                tracing::warn!(id = %ps.id, error = %e, "resume join error");
+            }
+        }
+    }
+}
+
 async fn handle_client(
     stream: interprocess::local_socket::tokio::Stream,
     registry: SessionRegistry,
+    store: Store,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
@@ -95,7 +148,7 @@ async fn handle_client(
                 continue;
             }
         };
-        let resp = dispatch(&req, &registry, &shutdown).await;
+        let resp = dispatch(&req, &registry, &store, &shutdown).await;
         let mut out = serde_json::to_string(&resp)?;
         out.push('\n');
         writer.write_all(out.as_bytes()).await?;
@@ -106,6 +159,7 @@ async fn handle_client(
 async fn dispatch(
     req: &Request,
     registry: &SessionRegistry,
+    store: &Store,
     shutdown: &Notify,
 ) -> Response {
     match req.method.as_str() {
@@ -115,7 +169,7 @@ async fn dispatch(
             ok(req.id, json!("shutting down"))
         }
         "create_session" => match serde_json::from_value::<CreateSessionParams>(req.params.clone()) {
-            Ok(p) => handle_create(req.id, p, registry).await,
+            Ok(p) => handle_create(req.id, p, registry, store).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
         "list_sessions" => handle_list(req.id, registry).await,
@@ -128,7 +182,7 @@ async fn dispatch(
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
         "close_session" => match serde_json::from_value::<SessionIdParam>(req.params.clone()) {
-            Ok(p) => handle_close(req.id, p, registry).await,
+            Ok(p) => handle_close(req.id, p, registry, store).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
         "hook_event" => match serde_json::from_value::<HookEventParams>(req.params.clone()) {
@@ -143,7 +197,12 @@ async fn dispatch(
     }
 }
 
-async fn handle_create(id: u64, p: CreateSessionParams, reg: &SessionRegistry) -> Response {
+async fn handle_create(
+    id: u64,
+    p: CreateSessionParams,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> Response {
     tracing::info!(cwd = %p.cwd, name = ?p.name, model = ?p.model, "create_session: begin");
     let cwd = PathBuf::from(&p.cwd);
     if !cwd.is_dir() {
@@ -153,8 +212,6 @@ async fn handle_create(id: u64, p: CreateSessionParams, reg: &SessionRegistry) -
         );
     }
 
-    // Pre-generate the session UUID so we can write the per-session settings.json
-    // and pass `--session-id <uuid>` and `--settings <path>` together.
     let session_id = Uuid::new_v4();
     let settings_path = match hook::write_settings_for(session_id) {
         Ok(p) => Some(p),
@@ -168,7 +225,7 @@ async fn handle_create(id: u64, p: CreateSessionParams, reg: &SessionRegistry) -
     let name = p.name.clone();
     let model = p.model.clone();
     let session = match tokio::task::spawn_blocking(move || {
-        spawn_session(session_id, cwd_clone, name, model, settings_path)
+        spawn_session(session_id, cwd_clone, name, model, settings_path, SpawnMode::Fresh)
     })
     .await
     {
@@ -181,6 +238,17 @@ async fn handle_create(id: u64, p: CreateSessionParams, reg: &SessionRegistry) -
     };
     tracing::info!(session_id = %session.id, "create_session: spawn returned");
     let info = session_info(&session);
+
+    if let Err(e) = store.insert(
+        session.id,
+        &session.cwd.to_string_lossy(),
+        &session.name,
+        session.model_requested.as_deref(),
+        info.started_at_ms,
+    ) {
+        tracing::warn!(error = %e, "failed to persist session metadata");
+    }
+
     reg.insert(session);
     ok(id, serde_json::to_value(info).unwrap())
 }
@@ -222,12 +290,19 @@ async fn handle_read_output(id: u64, p: ReadOutputParams, reg: &SessionRegistry)
     ok(id, serde_json::to_value(result).unwrap())
 }
 
-async fn handle_close(id: u64, p: SessionIdParam, reg: &SessionRegistry) -> Response {
-    // Remove from registry immediately, then send kill. Reader/waiter threads
-    // each hold their own Arc<SessionRuntime>, so the underlying state stays
-    // alive until they finish — no leak. The session simply disappears from
-    // future list_sessions calls right away, which matches the user's mental
-    // model of "I closed it, why is it still here?".
+async fn handle_close(
+    id: u64,
+    p: SessionIdParam,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> Response {
+    // Mark closed_by_user in the store BEFORE removing from registry — this
+    // prevents auto-resume from bringing back a session the user explicitly
+    // asked to delete. Sessions that exit on their own (claude crash, /quit,
+    // daemon restart) keep closed_by_user=0 and DO get resumed next time.
+    if let Err(e) = store.mark_closed_by_user(p.session_id) {
+        tracing::warn!(error = %e, "could not mark session closed_by_user");
+    }
     match reg.remove(p.session_id) {
         Some(s) => {
             s.close();

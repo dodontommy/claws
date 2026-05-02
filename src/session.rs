@@ -8,6 +8,14 @@ use std::time::SystemTime;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnMode {
+    /// New conversation: pass `--session-id <uuid>` to claude.
+    Fresh,
+    /// Resume an existing transcript: pass `--resume <uuid>` to claude.
+    Resume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Spawning,
     Idle,
@@ -83,6 +91,7 @@ pub fn spawn_session(
     name: Option<String>,
     model: Option<String>,
     settings_path: Option<PathBuf>,
+    mode: SpawnMode,
 ) -> Result<Session> {
     let display_name = name.unwrap_or_else(|| {
         cwd.file_name()
@@ -97,8 +106,16 @@ pub fn spawn_session(
         .context("openpty failed")?;
 
     let mut cmd = CommandBuilder::new("claude");
-    cmd.arg("--session-id");
-    cmd.arg(id.to_string());
+    match mode {
+        SpawnMode::Fresh => {
+            cmd.arg("--session-id");
+            cmd.arg(id.to_string());
+        }
+        SpawnMode::Resume => {
+            cmd.arg("--resume");
+            cmd.arg(id.to_string());
+        }
+    }
     if let Some(m) = &model {
         cmd.arg("--model");
         cmd.arg(m);
