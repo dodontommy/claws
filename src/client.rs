@@ -157,6 +157,7 @@ pub async fn read_output_raw(session_id: uuid::Uuid, since: u64) -> Result<(Vec<
 
 fn print_resp(resp: &Response) {
     match (&resp.result, &resp.error) {
+        (Some(Value::String(s)), _) => println!("{s}"),
         (Some(v), _) => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
         (_, Some(e)) => eprintln!("error {}: {}", e.code, e.message),
         _ => eprintln!("(empty response)"),
