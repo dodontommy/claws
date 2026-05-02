@@ -1,29 +1,35 @@
 use crate::ring::RingBuffer;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::path::PathBuf;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
-    Running,
+    Spawning,
+    Idle,
+    Streaming,
+    AwaitingPermission,
     Exited(i32),
 }
 
 impl SessionStatus {
     pub fn label(&self) -> &'static str {
         match self {
-            SessionStatus::Running => "running",
+            SessionStatus::Spawning => "spawning",
+            SessionStatus::Idle => "idle",
+            SessionStatus::Streaming => "streaming",
+            SessionStatus::AwaitingPermission => "awaiting_permission",
             SessionStatus::Exited(_) => "exited",
         }
     }
-
     pub fn exit_code(&self) -> Option<i32> {
         match self {
-            SessionStatus::Running => None,
             SessionStatus::Exited(c) => Some(*c),
+            _ => None,
         }
     }
 }
@@ -33,8 +39,21 @@ pub struct Session {
     pub name: String,
     pub cwd: PathBuf,
     pub started_at: SystemTime,
-    pub model: Option<String>,
+    pub model_requested: Option<String>,
     state: Arc<Mutex<SessionRuntime>>,
+}
+
+pub struct SessionSnapshot {
+    pub status: SessionStatus,
+    pub last_activity: SystemTime,
+    pub current_tool: Option<String>,
+    pub last_message: Option<String>,
+    pub ai_title: Option<String>,
+    pub model: Option<String>,
+    pub turn_count: u32,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
 }
 
 struct SessionRuntime {
@@ -45,16 +64,26 @@ struct SessionRuntime {
     _master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn std::io::Write + Send>,
     kill_tx: Option<mpsc::Sender<()>>,
+
+    current_tool: Option<String>,
+    last_message: Option<String>,
+    ai_title: Option<String>,
+    model_actual: Option<String>,
+    turn_count: u32,
+    tokens_input: u64,
+    tokens_output: u64,
+    tokens_cache_read: u64,
 }
 
 const RING_CAP: usize = 1024 * 1024;
 
 pub fn spawn_session(
+    id: Uuid,
     cwd: PathBuf,
     name: Option<String>,
     model: Option<String>,
+    settings_path: Option<PathBuf>,
 ) -> Result<Session> {
-    let id = Uuid::new_v4();
     let display_name = name.unwrap_or_else(|| {
         cwd.file_name()
             .and_then(|s| s.to_str())
@@ -64,12 +93,7 @@ pub fn spawn_session(
 
     let pty = native_pty_system();
     let pair = pty
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
         .context("openpty failed")?;
 
     let mut cmd = CommandBuilder::new("claude");
@@ -78,6 +102,10 @@ pub fn spawn_session(
     if let Some(m) = &model {
         cmd.arg("--model");
         cmd.arg(m);
+    }
+    if let Some(s) = &settings_path {
+        cmd.arg("--settings");
+        cmd.arg(s.to_string_lossy().as_ref());
     }
     cmd.cwd(&cwd);
     for (k, v) in std::env::vars() {
@@ -90,23 +118,25 @@ pub fn spawn_session(
         .context("failed to spawn claude")?;
     drop(pair.slave);
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .context("failed to clone PTY reader")?;
-    let writer = pair
-        .master
-        .take_writer()
-        .context("failed to take PTY writer")?;
+    let reader = pair.master.try_clone_reader().context("clone PTY reader")?;
+    let writer = pair.master.take_writer().context("take PTY writer")?;
 
     let (kill_tx, kill_rx) = mpsc::channel::<()>();
     let runtime = Arc::new(Mutex::new(SessionRuntime {
-        status: SessionStatus::Running,
+        status: SessionStatus::Spawning,
         last_activity: SystemTime::now(),
         ring: RingBuffer::new(RING_CAP),
         _master: pair.master,
         writer,
         kill_tx: Some(kill_tx),
+        current_tool: None,
+        last_message: None,
+        ai_title: None,
+        model_actual: None,
+        turn_count: 0,
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
     }));
 
     {
@@ -117,13 +147,17 @@ pub fn spawn_session(
         let runtime = runtime.clone();
         std::thread::spawn(move || pty_waiter_loop(runtime, child, kill_rx));
     }
+    if let Ok(jsonl) = jsonl_path_for(&cwd, id) {
+        let runtime = runtime.clone();
+        std::thread::spawn(move || jsonl_tail_loop(runtime, jsonl));
+    }
 
     Ok(Session {
         id,
         name: display_name,
         cwd,
         started_at: SystemTime::now(),
-        model,
+        model_requested: model,
         state: runtime,
     })
 }
@@ -179,6 +213,145 @@ fn pty_waiter_loop(
     }
 }
 
+fn jsonl_path_for(cwd: &Path, session_id: Uuid) -> Result<PathBuf> {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))?;
+    let cwd_str = cwd.to_string_lossy();
+    let slug: String = cwd_str
+        .chars()
+        .map(|c| match c {
+            ':' | '/' | '\\' => '-',
+            x => x,
+        })
+        .collect();
+    Ok(PathBuf::from(home)
+        .join(".claude")
+        .join("projects")
+        .join(slug)
+        .join(format!("{session_id}.jsonl")))
+}
+
+fn jsonl_tail_loop(runtime: Arc<Mutex<SessionRuntime>>, path: PathBuf) {
+    use std::fs::File;
+
+    // Wait for file to appear (claude takes a beat to create it)
+    let mut waited_ms = 0u64;
+    while !path.exists() {
+        if matches!(runtime.lock().unwrap().status, SessionStatus::Exited(_)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited_ms += 100;
+        if waited_ms > 60_000 {
+            tracing::warn!(path = %path.display(), "JSONL never appeared, abandoning tail");
+            return;
+        }
+    }
+
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open JSONL for tail");
+            return;
+        }
+    };
+    let mut pos: u64 = 0;
+    let mut leftover = String::new();
+
+    loop {
+        let exited = matches!(runtime.lock().unwrap().status, SessionStatus::Exited(_));
+        let _ = drain_and_process(&mut file, &mut pos, &mut leftover, &runtime);
+        if exited {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn drain_and_process(
+    file: &mut std::fs::File,
+    pos: &mut u64,
+    leftover: &mut String,
+    runtime: &Arc<Mutex<SessionRuntime>>,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(*pos))?;
+    let mut new_bytes = Vec::new();
+    file.read_to_end(&mut new_bytes)?;
+    if new_bytes.is_empty() {
+        return Ok(());
+    }
+    *pos += new_bytes.len() as u64;
+    let text = match std::str::from_utf8(&new_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return Ok(()),
+    };
+    let combined: String = leftover.clone() + &text;
+    let mut last_nl = 0;
+    for (i, ch) in combined.char_indices() {
+        if ch == '\n' {
+            let line = &combined[last_nl..i];
+            if !line.is_empty() {
+                process_jsonl_line(runtime, line);
+            }
+            last_nl = i + 1;
+        }
+    }
+    *leftover = combined[last_nl..].to_string();
+    Ok(())
+}
+
+fn process_jsonl_line(runtime: &Arc<Mutex<SessionRuntime>>, line: &str) {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let mut s = runtime.lock().unwrap();
+    match event_type {
+        "ai-title" => {
+            if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
+                s.ai_title = Some(t.to_string());
+            }
+        }
+        "user" => {
+            // The "user" type message corresponds to a user prompt turn.
+            // Filter out queue-operation entries which are also typed but lack a
+            // proper `message` body.
+            if v.get("message").is_some() {
+                s.turn_count = s.turn_count.saturating_add(1);
+            }
+        }
+        "assistant" => {
+            let msg = v.get("message");
+            if let Some(arr) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                let texts: Vec<&str> = arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                let joined = texts.join(" ");
+                if !joined.is_empty() {
+                    s.last_message = Some(joined.chars().take(200).collect());
+                }
+            }
+            if let Some(model) = msg.and_then(|m| m.get("model")).and_then(|m| m.as_str()) {
+                s.model_actual = Some(model.to_string());
+            }
+            if let Some(usage) = msg.and_then(|m| m.get("usage")) {
+                if let Some(t) = usage.get("input_tokens").and_then(|t| t.as_u64()) {
+                    s.tokens_input += t;
+                }
+                if let Some(t) = usage.get("output_tokens").and_then(|t| t.as_u64()) {
+                    s.tokens_output += t;
+                }
+                if let Some(t) = usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()) {
+                    s.tokens_cache_read += t;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Session {
     pub fn send_input(&self, data: &[u8]) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -197,14 +370,67 @@ impl Session {
         self.state.lock().unwrap().status
     }
 
-    pub fn last_activity(&self) -> SystemTime {
-        self.state.lock().unwrap().last_activity
-    }
-
     pub fn close(&self) {
         let mut s = self.state.lock().unwrap();
         if let Some(tx) = s.kill_tx.take() {
             let _ = tx.send(());
+        }
+    }
+
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let s = self.state.lock().unwrap();
+        SessionSnapshot {
+            status: s.status,
+            last_activity: s.last_activity,
+            current_tool: s.current_tool.clone(),
+            last_message: s.last_message.clone(),
+            ai_title: s.ai_title.clone(),
+            model: s.model_actual.clone().or_else(|| self.model_requested.clone()),
+            turn_count: s.turn_count,
+            tokens_input: s.tokens_input,
+            tokens_output: s.tokens_output,
+            tokens_cache_read: s.tokens_cache_read,
+        }
+    }
+
+    pub fn on_hook_event(&self, event: &str, payload: &Value) {
+        let mut s = self.state.lock().unwrap();
+        s.last_activity = SystemTime::now();
+        match event {
+            "SessionStart" => {
+                if matches!(s.status, SessionStatus::Spawning) {
+                    s.status = SessionStatus::Idle;
+                }
+            }
+            "UserPromptSubmit" => {
+                s.status = SessionStatus::Streaming;
+            }
+            "PreToolUse" => {
+                s.status = SessionStatus::Streaming;
+                s.current_tool = payload
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+            "PostToolUse" | "PostToolUseFailure" => {
+                s.current_tool = None;
+            }
+            "Notification" | "PermissionRequest" => {
+                s.status = SessionStatus::AwaitingPermission;
+                if let Some(tool) = payload.get("tool_name").and_then(|v| v.as_str()) {
+                    s.current_tool = Some(tool.to_string());
+                }
+            }
+            "Stop" => {
+                if !matches!(s.status, SessionStatus::Exited(_)) {
+                    s.status = SessionStatus::Idle;
+                }
+                s.current_tool = None;
+            }
+            "SessionEnd" => {
+                // Wait for waiter task to detect process exit.
+            }
+            _ => {}
         }
     }
 }

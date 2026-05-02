@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 mod client;
 mod daemon;
+mod hook;
 mod paths;
 mod protocol;
 mod registry;
@@ -29,13 +31,10 @@ enum Command {
     Logs,
     /// Spawn a new claude session in the daemon
     New {
-        /// Working directory for the session
         #[arg(long)]
         cwd: Option<String>,
-        /// Friendly name for the session (defaults to cwd basename)
         #[arg(long)]
         name: Option<String>,
-        /// Model alias or full id
         #[arg(long)]
         model: Option<String>,
     },
@@ -54,6 +53,14 @@ enum Command {
     },
     /// Close (kill) a session
     Close { session_id: String },
+    /// Internal: invoked by Claude Code hooks. Reads payload from stdin.
+    #[command(hide = true)]
+    HookEmit {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        event: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -85,6 +92,7 @@ fn main() -> Result<()> {
             Some(Command::Send { session_id, data }) => client::send_input(session_id, data).await,
             Some(Command::Read { session_id, since }) => client::read_output(session_id, since).await,
             Some(Command::Close { session_id }) => client::close_session(session_id).await,
+            Some(Command::HookEmit { session, event }) => hook::run_hook_emit(session, event).await,
         }
     })
 }

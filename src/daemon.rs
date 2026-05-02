@@ -1,7 +1,8 @@
+use crate::hook;
 use crate::paths;
 use crate::protocol::*;
 use crate::registry::SessionRegistry;
-use crate::session::{spawn_session, Session, SessionStatus};
+use crate::session::{spawn_session, Session};
 use anyhow::{Context, Result};
 use base64::Engine;
 use interprocess::local_socket::tokio::prelude::*;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 pub async fn run() -> Result<()> {
     let sock = paths::socket_name()?;
@@ -129,6 +131,10 @@ async fn dispatch(
             Ok(p) => handle_close(req.id, p, registry).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
+        "hook_event" => match serde_json::from_value::<HookEventParams>(req.params.clone()) {
+            Ok(p) => handle_hook_event(req.id, p, registry).await,
+            Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
+        },
         other => err(req.id, RpcError::method_not_found(other)),
     }
 }
@@ -137,30 +143,41 @@ async fn handle_create(id: u64, p: CreateSessionParams, reg: &SessionRegistry) -
     tracing::info!(cwd = %p.cwd, name = ?p.name, model = ?p.model, "create_session: begin");
     let cwd = PathBuf::from(&p.cwd);
     if !cwd.is_dir() {
-        tracing::warn!(cwd = %p.cwd, "create_session: cwd not a directory");
         return err(
             id,
             RpcError::invalid_params(format!("cwd does not exist or is not a directory: {}", p.cwd)),
         );
     }
-    tracing::info!("create_session: spawning (this may block while claude starts)");
-    let session = match tokio::task::spawn_blocking(move || spawn_session(cwd, p.name, p.model))
-        .await
+
+    // Pre-generate the session UUID so we can write the per-session settings.json
+    // and pass `--session-id <uuid>` and `--settings <path>` together.
+    let session_id = Uuid::new_v4();
+    let settings_path = match hook::write_settings_for(session_id) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to write hook settings; spawning without hooks");
+            None
+        }
+    };
+
+    let cwd_clone = cwd.clone();
+    let name = p.name.clone();
+    let model = p.model.clone();
+    let session = match tokio::task::spawn_blocking(move || {
+        spawn_session(session_id, cwd_clone, name, model, settings_path)
+    })
+    .await
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            tracing::error!(error = ?e, "create_session: spawn_session failed");
+            tracing::error!(error = ?e, "spawn_session failed");
             return err(id, RpcError::internal(format!("spawn failed: {e:#}")));
         }
-        Err(e) => {
-            tracing::error!(error = %e, "create_session: join error");
-            return err(id, RpcError::internal(format!("join failed: {e}")));
-        }
+        Err(e) => return err(id, RpcError::internal(format!("join failed: {e}"))),
     };
-    tracing::info!(session_id = %session.id, "create_session: spawn returned, registering");
+    tracing::info!(session_id = %session.id, "create_session: spawn returned");
     let info = session_info(&session);
     reg.insert(session);
-    tracing::info!("create_session: done");
     ok(id, serde_json::to_value(info).unwrap())
 }
 
@@ -205,25 +222,44 @@ async fn handle_close(id: u64, p: SessionIdParam, reg: &SessionRegistry) -> Resp
     match reg.get(p.session_id) {
         Some(s) => {
             s.close();
-            // Don't remove from registry yet — let the waiter task transition status to Exited;
-            // a subsequent close_session can fully remove.
             ok(id, json!({"closed": true}))
         }
         None => err(id, RpcError::session_not_found(p.session_id)),
     }
 }
 
+async fn handle_hook_event(id: u64, p: HookEventParams, reg: &SessionRegistry) -> Response {
+    match reg.get(p.session_id) {
+        Some(s) => {
+            tracing::debug!(session_id = %p.session_id, event = %p.event, "hook event");
+            s.on_hook_event(&p.event, &p.payload);
+            ok(id, json!("ok"))
+        }
+        None => {
+            tracing::debug!(session_id = %p.session_id, event = %p.event, "hook for unknown session");
+            err(id, RpcError::session_not_found(p.session_id))
+        }
+    }
+}
+
 fn session_info(s: &Session) -> SessionInfo {
-    let status = s.status();
+    let snap = s.snapshot();
     SessionInfo {
         id: s.id,
         name: s.name.clone(),
         cwd: s.cwd.to_string_lossy().into_owned(),
-        status: status.label().to_string(),
-        exit_code: status.exit_code(),
+        status: snap.status.label().to_string(),
+        exit_code: snap.status.exit_code(),
         started_at_ms: ms_since_epoch(s.started_at),
-        last_activity_ms: ms_since_epoch(s.last_activity()),
-        model: s.model.clone(),
+        last_activity_ms: ms_since_epoch(snap.last_activity),
+        model: snap.model,
+        current_tool: snap.current_tool,
+        last_message: snap.last_message,
+        ai_title: snap.ai_title,
+        turn_count: snap.turn_count,
+        tokens_input: snap.tokens_input,
+        tokens_output: snap.tokens_output,
+        tokens_cache_read: snap.tokens_cache_read,
     }
 }
 

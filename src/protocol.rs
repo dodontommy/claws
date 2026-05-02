@@ -41,31 +41,16 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn method_not_found(method: &str) -> Self {
-        Self {
-            code: -32601,
-            message: format!("method not found: {method}"),
-        }
+        Self { code: -32601, message: format!("method not found: {method}") }
     }
-
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32602,
-            message: msg.into(),
-        }
+        Self { code: -32602, message: msg.into() }
     }
-
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32603,
-            message: msg.into(),
-        }
+        Self { code: -32603, message: msg.into() }
     }
-
     pub fn session_not_found(id: Uuid) -> Self {
-        Self {
-            code: -32004,
-            message: format!("session not found: {id}"),
-        }
+        Self { code: -32004, message: format!("session not found: {id}") }
     }
 }
 
@@ -90,8 +75,22 @@ pub struct SessionInfo {
     pub exit_code: Option<i32>,
     pub started_at_ms: u128,
     pub last_activity_ms: u128,
+
+    // Tier 2 fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_title: Option<String>,
+    pub turn_count: u32,
+
+    // Tier 3 — token usage
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,4 +118,12 @@ pub struct ReadOutputResult {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HookEventParams {
+    pub session_id: Uuid,
+    pub event: String,
+    #[serde(default)]
+    pub payload: Value,
 }

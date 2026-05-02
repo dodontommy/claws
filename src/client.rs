@@ -53,11 +53,9 @@ pub async fn read_output(session_id: String, since: u64) -> Result<()> {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_b64)
             .unwrap_or_default();
-        // Print metadata to stderr so stdout stays raw PTY bytes if you pipe it
         let next_seq = result.get("next_seq").and_then(|v| v.as_u64()).unwrap_or(0);
         let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         eprintln!("[{} bytes, next_seq={}, status={}]", bytes.len(), next_seq, status);
-        // Print PTY bytes — write_all so binary passes through cleanly
         use std::io::Write;
         std::io::stdout().write_all(&bytes).ok();
         std::io::stdout().flush().ok();
@@ -86,9 +84,18 @@ async fn call_with_autospawn(method: &str, params: Value) -> Result<Response> {
     rpc_round_trip(stream, method, params).await
 }
 
-async fn call_no_spawn(method: &str, params: Value) -> Result<Response> {
+pub(crate) async fn call_no_spawn(method: &str, params: Value) -> Result<Response> {
     let stream = connect_once().await?;
     rpc_round_trip(stream, method, params).await
+}
+
+/// Like `call_no_spawn` but eats all errors. Used for hook-emit, where we
+/// must never break the user's claude session because the daemon is down.
+pub(crate) async fn call_no_spawn_silent(method: &str, params: Value) -> Result<()> {
+    if let Ok(stream) = connect_once().await {
+        let _ = rpc_round_trip(stream, method, params).await;
+    }
+    Ok(())
 }
 
 async fn connect_once() -> Result<interprocess::local_socket::tokio::Stream> {
