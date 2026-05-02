@@ -10,7 +10,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io::Stdout;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,6 +50,7 @@ struct App {
     status_message: Option<(String, SystemTime)>,
     quit: bool,
     view: View,
+    tick_phase: u32,
 }
 
 impl App {
@@ -60,6 +61,7 @@ impl App {
             status_message: None,
             quit: false,
             view: View::Dashboard,
+            tick_phase: 0,
         }
     }
 
@@ -130,7 +132,9 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<
 }
 
 async fn tick_work(app: &mut App) {
-    // Attached view: high-frequency PTY-bytes poll
+    app.tick_phase = app.tick_phase.wrapping_add(1);
+
+    // Attached view: high-frequency PTY-bytes poll.
     if let View::Attached {
         session_id,
         parser,
@@ -138,23 +142,16 @@ async fn tick_work(app: &mut App) {
         ..
     } = &mut app.view
     {
-        if let Ok((bytes, next, status)) = client::read_output_raw(*session_id, *read_seq).await {
+        if let Ok((bytes, next, _status)) = client::read_output_raw(*session_id, *read_seq).await {
             if !bytes.is_empty() {
                 parser.process(&bytes);
             }
             *read_seq = next;
-            // If session exited, just stay attached and let the user detach.
-            let _ = status;
         }
     }
 
-    // Lower-frequency dashboard refresh — do it every ~10 ticks (500ms).
-    static mut TICK_COUNT: u32 = 0;
-    let do_list = unsafe {
-        TICK_COUNT = TICK_COUNT.wrapping_add(1);
-        TICK_COUNT % 10 == 0
-    };
-    if do_list {
+    // Lower-frequency dashboard refresh: every 10 ticks (500ms).
+    if app.tick_phase % 10 == 0 {
         refresh_sessions(app).await;
     }
 }
@@ -367,48 +364,107 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(2), // title + separator
+            Constraint::Min(0),    // body
+            Constraint::Length(2), // separator + footer
         ])
         .split(f.area());
 
-    let title = format!(
-        " claws — {} session{}",
+    // Title row: bold "claws" + dim count + right-aligned cwd hint of selected card
+    let count_part = format!(
+        "{} session{}",
         app.sessions.len(),
         if app.sessions.len() == 1 { "" } else { "s" }
     );
+    let cwd_hint = app
+        .sessions
+        .get(app.selected)
+        .map(|s| s.cwd.as_str())
+        .unwrap_or("");
+    let title_w = chunks[0].width as usize;
+    let left = format!(" claws  ╲  {count_part}");
+    let title_line = if cwd_hint.is_empty() {
+        left
+    } else {
+        let avail = title_w.saturating_sub(left.chars().count() + 2);
+        let cwd_short = truncate_ellipsis(cwd_hint, avail);
+        let pad = title_w
+            .saturating_sub(left.chars().count() + cwd_short.chars().count())
+            .saturating_sub(1);
+        format!("{left}{}{cwd_short} ", " ".repeat(pad))
+    };
     f.render_widget(
-        Paragraph::new(title)
+        Paragraph::new(title_line)
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        chunks[0],
+        Rect::new(chunks[0].x, chunks[0].y, chunks[0].width, 1),
+    );
+    f.render_widget(
+        Paragraph::new("─".repeat(title_w)).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
     );
 
     if app.sessions.is_empty() {
-        f.render_widget(
-            Paragraph::new("\n\n  No sessions. Press 'c' to create one in the current directory.\n")
-                .style(Style::default().fg(Color::DarkGray)),
-            chunks[1],
-        );
+        draw_empty_state(f, chunks[1]);
     } else {
-        draw_cards(f, &app.sessions, app.selected, chunks[1]);
+        draw_cards(f, &app.sessions, app.selected, app.tick_phase, chunks[1]);
     }
 
+    // Footer separator + help/status line
+    let footer_w = chunks[2].width as usize;
+    f.render_widget(
+        Paragraph::new("─".repeat(footer_w)).style(Style::default().fg(Color::DarkGray)),
+        Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
+    );
     let status_text = if let Some((msg, _)) = &app.status_message {
         format!(" {msg}")
     } else {
-        " j/k move · Enter attach · c new · x close · r refresh · q quit".to_string()
+        " j/k  move    enter  attach    c  new    x  close    r  refresh    q  quit".to_string()
     };
     f.render_widget(
         Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
     );
 }
 
-const CARD_W: u16 = 38;
-const CARD_H: u16 = 5;
+fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
+    let lines = vec![
+        "".to_string(),
+        "".to_string(),
+        "◌".to_string(),
+        "".to_string(),
+        "no sessions yet".to_string(),
+        "".to_string(),
+        "press  c  to create one here".to_string(),
+    ];
+    let h = lines.len() as u16;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    for (i, line) in lines.iter().enumerate() {
+        let w = line.chars().count() as u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let style = match i {
+            2 => Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+            4 => Style::default().fg(Color::Gray),
+            _ => Style::default().fg(Color::DarkGray),
+        };
+        f.render_widget(
+            Paragraph::new(line.clone()).style(style),
+            Rect::new(x, y + i as u16, w, 1),
+        );
+    }
+}
 
-fn draw_cards(f: &mut ratatui::Frame, sessions: &[SessionInfo], selected: usize, area: Rect) {
+const CARD_W: u16 = 40;
+const CARD_H: u16 = 6;
+
+fn draw_cards(
+    f: &mut ratatui::Frame,
+    sessions: &[SessionInfo],
+    selected: usize,
+    tick_phase: u32,
+    area: Rect,
+) {
     let cols = ((area.width / CARD_W).max(1)) as usize;
     for (idx, s) in sessions.iter().enumerate() {
         let row = (idx / cols) as u16;
@@ -420,68 +476,154 @@ fn draw_cards(f: &mut ratatui::Frame, sessions: &[SessionInfo], selected: usize,
         }
         let w = CARD_W.min(area.width.saturating_sub(col * CARD_W));
         let card_area = Rect::new(x, y, w, CARD_H);
-        draw_card(f, s, idx == selected, card_area);
+        draw_card(f, s, idx == selected, tick_phase, card_area);
     }
 }
 
-fn draw_card(f: &mut ratatui::Frame, s: &SessionInfo, selected: bool, area: Rect) {
-    let border_color = match s.status.as_str() {
+fn status_color(status: &str) -> Color {
+    match status {
         "spawning" => Color::DarkGray,
         "idle" => Color::Green,
         "streaming" => Color::Yellow,
-        "awaiting_permission" => Color::Red,
+        "awaiting_permission" => Color::LightMagenta,
         "exited" => Color::DarkGray,
         _ => Color::White,
-    };
-    let border_style = if selected {
-        Style::default()
-            .fg(border_color)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(border_color)
-    };
+    }
+}
 
-    let glyph = match s.status.as_str() {
+fn status_glyph(status: &str, tick_phase: u32) -> &'static str {
+    match status {
         "spawning" => "◌",
         "idle" => "●",
-        "streaming" => "◐",
+        "streaming" => {
+            const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+            FRAMES[((tick_phase / 3) % 4) as usize]
+        }
         "awaiting_permission" => "★",
         "exited" => "○",
         _ => "?",
+    }
+}
+
+fn draw_card(
+    f: &mut ratatui::Frame,
+    s: &SessionInfo,
+    selected: bool,
+    tick_phase: u32,
+    area: Rect,
+) {
+    let color = status_color(&s.status);
+    let border_type = if selected { BorderType::Double } else { BorderType::Plain };
+    let border_style = if selected {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color)
     };
+
+    let glyph = status_glyph(&s.status, tick_phase);
     let display_name = s.ai_title.as_deref().unwrap_or(&s.name);
-    let model_short = s.model.as_deref().map(short_model).unwrap_or("");
-    let title = format!(" {glyph} {display_name} — {model_short} ");
+    let title_text = format!(" {glyph}  {display_name} ");
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(border_type)
         .border_style(border_style)
-        .title(title);
+        .title(ratatui::text::Span::styled(
+            title_text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    use ratatui::text::{Line, Span};
+
+    // Inner padding: 1 char left margin
+    let pad = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+
     let time_ago = format_time_ago(s.last_activity_ms);
-    let tool_part = s
-        .current_tool
-        .as_deref()
-        .map(|t| format!(" · {t}"))
-        .unwrap_or_default();
-    let exit_part = s.exit_code.map(|c| format!(" · exit {c}")).unwrap_or_default();
-    let line1 = format!("{} · {}{}{}", s.status, time_ago, tool_part, exit_part);
-    let line2 = s
-        .last_message
-        .as_deref()
-        .unwrap_or("(no messages yet)")
-        .to_string();
-    let line3 = format!(
-        "turns {} · in {} out {} cache {}",
-        s.turn_count, s.tokens_input, s.tokens_output, s.tokens_cache_read
+    let status_label = display_status(&s.status);
+    let tool_part = s.current_tool.as_deref().map(|t| format!("  ·  {t}")).unwrap_or_default();
+    let exit_part = s.exit_code.map(|c| format!("  ·  exit {c}")).unwrap_or_default();
+
+    let line1 = Line::from(vec![
+        Span::styled(status_label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::Gray)),
+        Span::styled(tool_part, Style::default().fg(Color::Cyan)),
+        Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let preview_avail = pad.width.saturating_sub(0) as usize;
+    let preview = match s.last_message.as_deref() {
+        Some(m) if !m.is_empty() => truncate_ellipsis(m, preview_avail),
+        _ => "(no messages yet)".to_string(),
+    };
+    let preview_style = if s.last_message.is_some() {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    };
+    let line2 = Line::from(Span::styled(preview, preview_style));
+
+    let model = s.model.as_deref().map(short_model).unwrap_or("—");
+    let toks = format!(
+        "{}t  ·  {}→{}  ·  ◷ {}",
+        s.turn_count,
+        compact_num(s.tokens_input),
+        compact_num(s.tokens_output),
+        compact_num(s.tokens_cache_read),
     );
-    f.render_widget(
-        Paragraph::new(format!("{line1}\n{line2}\n{line3}"))
-            .style(Style::default().fg(Color::Gray)),
-        inner,
-    );
+    let line3 = Line::from(vec![
+        Span::styled(model.to_string(), Style::default().fg(Color::Magenta)),
+        Span::styled(format!("  ·  {toks}"), Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let p = Paragraph::new(vec![line1, line2, line3]).wrap(Wrap { trim: false });
+    f.render_widget(p, pad);
+}
+
+fn display_status(s: &str) -> &'static str {
+    match s {
+        "spawning" => "spawning",
+        "idle" => "idle",
+        "streaming" => "streaming",
+        "awaiting_permission" => "needs you",
+        "exited" => "exited",
+        _ => "?",
+    }
+}
+
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let take = max.saturating_sub(1);
+    let mut out: String = chars.into_iter().take(take).collect();
+    out.push('…');
+    out
+}
+
+fn compact_num(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1000)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
 
 fn draw_attached(f: &mut ratatui::Frame, app: &App) {
@@ -501,32 +643,33 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
         _ => return,
     };
 
-    // Header — find the session info for richer display
+    // Header — name, status with color, time-ago, model
     let info = app.sessions.iter().find(|s| s.id == session_id);
-    let header = if let Some(s) = info {
-        let display_name = s.ai_title.as_deref().unwrap_or(&s.name);
-        format!(
-            " ⤓ attached — {} · {} ",
-            display_name,
-            s.status
-        )
+    use ratatui::text::{Line, Span};
+    let header_line = if let Some(s) = info {
+        let color = status_color(&s.status);
+        let glyph = status_glyph(&s.status, app.tick_phase);
+        let name = s.ai_title.as_deref().unwrap_or(&s.name);
+        let model = s.model.as_deref().map(short_model).unwrap_or("");
+        let time_ago = format_time_ago(s.last_activity_ms);
+        Line::from(vec![
+            Span::styled(format!(" {glyph}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  ·  {}", display_status(&s.status)), Style::default().fg(color)),
+            Span::styled(format!("  ·  {time_ago}"), Style::default().fg(Color::Gray)),
+            Span::styled(format!("  ·  {model}"), Style::default().fg(Color::Magenta)),
+        ])
     } else {
-        format!(" ⤓ attached — {session_id} ")
+        Line::from(Span::styled(format!(" attached — {session_id} "), Style::default().fg(Color::Cyan)))
     };
-    f.render_widget(
-        Paragraph::new(header)
-            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        chunks[0],
-    );
+    f.render_widget(Paragraph::new(header_line), chunks[0]);
 
-    // PTY pane — centered if user terminal is bigger than 80×24
     render_pty(f, parser, chunks[1]);
 
-    // Footer
     let footer = if prefix_active {
-        " prefix: d=detach q=quit ?=help — waiting for next key…".to_string()
+        " ◆ prefix:  d  detach    q  quit    ?  help    Ctrl-Space  literal".to_string()
     } else {
-        " Ctrl-Space then d=detach · q=quit · keys → claude".to_string()
+        " Ctrl-Space  prefix    keys → claude".to_string()
     };
     f.render_widget(
         Paragraph::new(footer).style(Style::default().fg(if prefix_active {
@@ -641,13 +784,15 @@ fn format_time_ago(ms_since_epoch: u128) -> String {
         .as_millis();
     let elapsed_ms = now.saturating_sub(ms_since_epoch);
     let seconds = elapsed_ms / 1000;
-    if seconds < 60 {
-        format!("{}s ago", seconds)
+    if seconds < 2 {
+        "now".to_string()
+    } else if seconds < 60 {
+        format!("{seconds}s")
     } else if seconds < 3600 {
-        format!("{}m ago", seconds / 60)
+        format!("{}m", seconds / 60)
     } else if seconds < 86400 {
-        format!("{}h ago", seconds / 3600)
+        format!("{}h", seconds / 3600)
     } else {
-        format!("{}d ago", seconds / 86400)
+        format!("{}d", seconds / 86400)
     }
 }
