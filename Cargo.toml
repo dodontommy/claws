@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["."]
+exclude = ["spike-pty"]
+
+[package]
+name = "claws"
+version = "0.1.0"
+edition = "2021"
+description = "TUI multiplexer for Claude Code sessions"
+publish = false
+
+[[bin]]
+name = "claws"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+interprocess = { version = "2", features = ["tokio"] }
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "fs", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
