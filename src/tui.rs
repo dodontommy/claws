@@ -653,9 +653,9 @@ fn draw_spawn_form(
     recent: &[String],
 ) {
     let parent = f.area();
-    let w = 78.min(parent.width.saturating_sub(4));
+    let w = 80.min(parent.width.saturating_sub(4));
     let recent_rows = recent.len().min(6) as u16;
-    let h = 9 + recent_rows;
+    let h = 10 + recent_rows;
     let area = centered_rect(w, h, parent);
 
     f.render_widget(Clear, area);
@@ -678,6 +678,7 @@ fn draw_spawn_form(
             Constraint::Length(1), // gap
             Constraint::Length(1), // args label
             Constraint::Length(1), // args input
+            Constraint::Length(1), // args examples
             Constraint::Length(1), // separator
             Constraint::Length(1), // recent label
             Constraint::Min(1),    // recent list
@@ -690,11 +691,14 @@ fn draw_spawn_form(
             inner.height,
         ));
 
-    let label_style = Style::default().fg(Color::DarkGray);
-    let active_label = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let label_dim = Style::default().fg(Color::DarkGray);
+    let label_active = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let working_dir_label = if focus == FormField::Cwd { "working directory" } else { "working directory" };
+    let flags_label = if focus == FormField::Args { "claude flags" } else { "claude flags" };
 
     f.render_widget(
-        Paragraph::new("cwd").style(if focus == FormField::Cwd { active_label } else { label_style }),
+        Paragraph::new(working_dir_label)
+            .style(if focus == FormField::Cwd { label_active } else { label_dim }),
         chunks[0],
     );
     f.render_widget(
@@ -703,16 +707,29 @@ fn draw_spawn_form(
     );
 
     f.render_widget(
-        Paragraph::new("args   (e.g. --dangerously-skip-permissions  --system-prompt \"…\")  shell-quoted")
-            .style(if focus == FormField::Args { active_label } else { label_style }),
+        Paragraph::new(flags_label)
+            .style(if focus == FormField::Args { label_active } else { label_dim }),
         chunks[3],
     );
+    if args.is_empty() && focus != FormField::Args {
+        // Placeholder hint inside the empty input box.
+        f.render_widget(
+            Paragraph::new("(none — claude runs with default behavior)")
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            chunks[4],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(args.to_string()).style(Style::default().fg(Color::White)),
+            chunks[4],
+        );
+    }
     f.render_widget(
-        Paragraph::new(args.to_string()).style(Style::default().fg(Color::White)),
-        chunks[4],
+        Paragraph::new("e.g.  --dangerously-skip-permissions   --system-prompt \"…\"   --effort xhigh   --add-dir <path>")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[5],
     );
 
-    // Cursor on whichever field is focused.
     match focus {
         FormField::Cwd => {
             f.set_cursor_position(Position::new(
@@ -729,18 +746,18 @@ fn draw_spawn_form(
     }
 
     f.render_widget(
-        Paragraph::new("─".repeat(chunks[5].width as usize))
+        Paragraph::new("─".repeat(chunks[6].width as usize))
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[5],
+        chunks[6],
     );
     f.render_widget(
-        Paragraph::new("recent").style(Style::default().fg(Color::DarkGray)),
-        chunks[6],
+        Paragraph::new("recent directories").style(Style::default().fg(Color::DarkGray)),
+        chunks[7],
     );
 
     for (i, dir) in recent.iter().take(6).enumerate() {
-        let y = chunks[7].y + i as u16;
-        if y >= chunks[7].y + chunks[7].height {
+        let y = chunks[8].y + i as u16;
+        if y >= chunks[8].y + chunks[8].height {
             break;
         }
         let marker = if i == recent_selected && focus == FormField::Cwd {
@@ -753,18 +770,18 @@ fn draw_spawn_form(
         } else {
             Style::default().fg(Color::Gray)
         };
-        let avail = chunks[7].width.saturating_sub(2) as usize;
+        let avail = chunks[8].width.saturating_sub(2) as usize;
         let line = format!("{marker}{}", truncate_ellipsis(&shorten_home(dir), avail));
         f.render_widget(
             Paragraph::new(line).style(style),
-            Rect::new(chunks[7].x, y, chunks[7].width, 1),
+            Rect::new(chunks[8].x, y, chunks[8].width, 1),
         );
     }
 
     f.render_widget(
-        Paragraph::new(" enter create   ·   tab field   ·   ↑/↓ recent (in cwd)   ·   esc cancel")
+        Paragraph::new(" enter create   ·   tab switch field   ·   ↑/↓ recent (cwd field)   ·   esc cancel")
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[8],
+        chunks[9],
     );
 }
 
