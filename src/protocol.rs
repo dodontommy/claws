@@ -127,3 +127,10 @@ pub struct HookEventParams {
     #[serde(default)]
     pub payload: Value,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResizeParams {
+    pub session_id: Uuid,
+    pub rows: u16,
+    pub cols: u16,
+}

@@ -16,8 +16,8 @@ use std::io::Stdout;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const PTY_ROWS: u16 = 24;
-const PTY_COLS: u16 = 80;
+// Reserve 1 row each for header and footer in attached view.
+const ATTACHED_CHROME_ROWS: u16 = 2;
 
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
@@ -107,7 +107,14 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(key, &mut app).await
                     }
-                    Some(Ok(Event::Resize(_, _))) => {}
+                    Some(Ok(Event::Resize(cols, rows))) => {
+                    if let View::Attached { session_id, parser, .. } = &mut app.view {
+                        let pane_rows = rows.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
+                        let pane_cols = cols.max(1);
+                        let _ = client::resize_session_raw(*session_id, pane_rows, pane_cols).await;
+                        parser.set_size(pane_rows, pane_cols);
+                    }
+                }
                     _ => {}
                 }
             }
@@ -212,9 +219,13 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
         (KeyCode::Enter, KeyModifiers::NONE) => {
             if let Some(s) = app.sessions.get(app.selected) {
                 if s.status != "exited" {
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let pane_rows = rows.saturating_sub(ATTACHED_CHROME_ROWS).max(1);
+                    let pane_cols = cols.max(1);
+                    let _ = client::resize_session_raw(s.id, pane_rows, pane_cols).await;
                     app.view = View::Attached {
                         session_id: s.id,
-                        parser: vt100::Parser::new(PTY_ROWS, PTY_COLS, 0),
+                        parser: vt100::Parser::new(pane_rows, pane_cols, 0),
                         read_seq: 0,
                         prefix_active: false,
                     };
@@ -530,25 +541,20 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
 fn render_pty(f: &mut ratatui::Frame, parser: &vt100::Parser, area: Rect) {
     let screen = parser.screen();
     let (rows, cols) = screen.size();
-    let pane_w = cols;
-    let pane_h = rows;
-    let x_off = area.x + area.width.saturating_sub(pane_w) / 2;
-    let y_off = area.y + area.height.saturating_sub(pane_h) / 2;
-
     let buf = f.buffer_mut();
-    for r in 0..pane_h {
-        if y_off + r >= area.y + area.height {
+    for r in 0..rows {
+        if r >= area.height {
             break;
         }
-        for c in 0..pane_w {
-            if x_off + c >= area.x + area.width {
+        for c in 0..cols {
+            if c >= area.width {
                 break;
             }
             let cell = match screen.cell(r, c) {
                 Some(cell) => cell,
                 None => continue,
             };
-            let target = match buf.cell_mut(Position::new(x_off + c, y_off + r)) {
+            let target = match buf.cell_mut(Position::new(area.x + c, area.y + r)) {
                 Some(t) => t,
                 None => continue,
             };
@@ -580,8 +586,8 @@ fn render_pty(f: &mut ratatui::Frame, parser: &vt100::Parser, area: Rect) {
 
     if !screen.hide_cursor() {
         let (cur_row, cur_col) = screen.cursor_position();
-        if cur_row < pane_h && cur_col < pane_w {
-            f.set_cursor_position(Position::new(x_off + cur_col, y_off + cur_row));
+        if cur_row < rows.min(area.height) && cur_col < cols.min(area.width) {
+            f.set_cursor_position(Position::new(area.x + cur_col, area.y + cur_row));
         }
     }
 }

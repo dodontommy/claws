@@ -377,6 +377,14 @@ impl Session {
         }
     }
 
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        let s = self.state.lock().unwrap();
+        s._master
+            .resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| anyhow::anyhow!("pty resize failed: {e}"))?;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         let s = self.state.lock().unwrap();
         SessionSnapshot {

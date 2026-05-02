@@ -135,6 +135,10 @@ async fn dispatch(
             Ok(p) => handle_hook_event(req.id, p, registry).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
+        "resize_session" => match serde_json::from_value::<ResizeParams>(req.params.clone()) {
+            Ok(p) => handle_resize(req.id, p, registry).await,
+            Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
+        },
         other => err(req.id, RpcError::method_not_found(other)),
     }
 }
@@ -229,6 +233,16 @@ async fn handle_close(id: u64, p: SessionIdParam, reg: &SessionRegistry) -> Resp
             s.close();
             ok(id, json!({"closed": true}))
         }
+        None => err(id, RpcError::session_not_found(p.session_id)),
+    }
+}
+
+async fn handle_resize(id: u64, p: ResizeParams, reg: &SessionRegistry) -> Response {
+    match reg.get(p.session_id) {
+        Some(s) => match s.resize(p.rows, p.cols) {
+            Ok(()) => ok(id, json!({"rows": p.rows, "cols": p.cols})),
+            Err(e) => err(id, RpcError::internal(format!("resize failed: {e}"))),
+        },
         None => err(id, RpcError::session_not_found(p.session_id)),
     }
 }

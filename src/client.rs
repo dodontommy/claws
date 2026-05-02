@@ -113,6 +113,15 @@ pub async fn send_input_raw(session_id: uuid::Uuid, data: Vec<u8>) -> Result<()>
     Ok(())
 }
 
+pub async fn resize_session_raw(session_id: uuid::Uuid, rows: u16, cols: u16) -> Result<()> {
+    let params = json!({"session_id": session_id.to_string(), "rows": rows, "cols": cols});
+    let resp = call_with_autospawn("resize_session", params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    Ok(())
+}
+
 pub async fn read_output_raw(session_id: uuid::Uuid, since: u64) -> Result<(Vec<u8>, u64, String)> {
     let params = json!({"session_id": session_id.to_string(), "since": since});
     let resp = call_with_autospawn("read_output", params).await?;
