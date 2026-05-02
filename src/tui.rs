@@ -1362,6 +1362,7 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
 }
 
 fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
+    let theme = crate::theme::current();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1371,7 +1372,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
 
-    // Title row: bold "claws" + dim count + right-aligned cwd hint of selected card
+    // Title row: theme-accent "claws" + dim count + right-aligned cwd hint
     let count_part = format!(
         "{} session{}",
         app.sessions.len(),
@@ -1383,24 +1384,31 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
         .map(|s| s.cwd.as_str())
         .unwrap_or("");
     let title_w = chunks[0].width as usize;
-    let left = format!(" claws  ╲  {count_part}");
-    let title_line = if cwd_hint.is_empty() {
-        left
-    } else {
-        let avail = title_w.saturating_sub(left.chars().count() + 2);
+    use ratatui::text::{Line, Span};
+    let mut spans = vec![
+        Span::styled(
+            " claws ",
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(theme.dim)),
+        Span::styled(count_part.clone(), Style::default().fg(theme.body)),
+    ];
+    if !cwd_hint.is_empty() {
+        let used = " claws ".chars().count() + " · ".chars().count() + count_part.chars().count();
+        let avail = title_w.saturating_sub(used + 2);
         let cwd_short = truncate_ellipsis(cwd_hint, avail);
         let pad = title_w
-            .saturating_sub(left.chars().count() + cwd_short.chars().count())
+            .saturating_sub(used + cwd_short.chars().count())
             .saturating_sub(1);
-        format!("{left}{}{cwd_short} ", " ".repeat(pad))
-    };
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(format!("{cwd_short} "), Style::default().fg(theme.cwd)));
+    }
     f.render_widget(
-        Paragraph::new(title_line)
-            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Paragraph::new(Line::from(spans)),
         Rect::new(chunks[0].x, chunks[0].y, chunks[0].width, 1),
     );
     f.render_widget(
-        Paragraph::new("─".repeat(title_w)).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("─".repeat(title_w)).style(Style::default().fg(theme.dim)),
         Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
     );
 
@@ -1426,7 +1434,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     // Footer separator + help/status line
     let footer_w = chunks[2].width as usize;
     f.render_widget(
-        Paragraph::new("─".repeat(footer_w)).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("─".repeat(footer_w)).style(Style::default().fg(theme.dim)),
         Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
     );
     let status_text = if let Some(filter) = app.filter.as_deref() {
@@ -1438,7 +1446,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
             .to_string()
     };
     f.render_widget(
-        Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(status_text).style(Style::default().fg(theme.dim)),
         Rect::new(chunks[2].x, chunks[2].y + 1, chunks[2].width, 1),
     );
 }
@@ -1454,14 +1462,13 @@ fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
         "  ▔▀██▀▔ ▀▀▀▀▀▀▀ ▔▀██▔▀ ",
         "    ▘▝     ▔▔▔     ▝▘   ",
     ];
+    // figlet "Standard" output. Five rows, the W is two clean V-joins.
     let wordmark = [
-        "                                          ",
-        "    ▄████▖ ██       █████  ▄    ▄ ▄████▖  ",
-        "   ██      ██      ██   ██ ██  ██ ██      ",
-        "   ██      ██      ███████ ██  ██ ▀████▖  ",
-        "   ██      ██      ██   ██ ██▙▟██     ██  ",
-        "    ▀████▘ ▝█████▘ ██   ██  ▝██▘  ▝████▘  ",
-        "                                          ",
+        "       _                     ",
+        "   ___| | __ ___      _____  ",
+        "  / __| |/ _` \\ \\ /\\ / / __| ",
+        " | (__| | (_| |\\ V  V /\\__ \\ ",
+        "  \\___|_|\\__,_| \\_/\\_/ |___/ ",
     ];
     let tagline = "many claws, one terminal";
     let prompt = "press  c  to spawn a session   ·   ?  for help";
@@ -1479,7 +1486,7 @@ fn draw_empty_state(f: &mut ratatui::Frame, area: Rect) {
         let x = x0 + (block_w.saturating_sub(w)) / 2;
         f.render_widget(
             Paragraph::new(line.to_string())
-                .style(Style::default().fg(theme.awaiting_a)),
+                .style(Style::default().fg(theme.idle)),
             Rect::new(x, y0 + row, w, 1),
         );
         row += 1;
@@ -1527,6 +1534,7 @@ fn draw_split(
     area: Rect,
     detail_scroll: u16,
 ) {
+    let theme = crate::theme::current();
     if area.width < SIDEBAR_W + 30 {
         // Terminal too narrow for split — fall back to a stacked single column.
         draw_sidebar(f, sessions, selected, tick_phase, area);
@@ -1542,10 +1550,10 @@ fn draw_split(
         .split(area);
 
     draw_sidebar(f, sessions, selected, tick_phase, chunks[0]);
-    // Vertical separator
+    // Vertical separator in theme color
     for y in chunks[1].y..chunks[1].y + chunks[1].height {
         f.render_widget(
-            Paragraph::new("│").style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("│").style(Style::default().fg(theme.dim)),
             Rect::new(chunks[1].x, y, 1, 1),
         );
     }
@@ -1591,39 +1599,44 @@ fn draw_sidebar_entry(
     tick_phase: u32,
     area: Rect,
 ) {
+    let theme = crate::theme::current();
     let color = status_color_pulsed(&s.status, tick_phase);
     let glyph = status_glyph(&s.status, tick_phase);
+
+    // Selected entry gets a 1-col theme-accent gutter on the left + subtle bg
+    // tint across the whole row. Much more visible than the previous ▎ marker.
+    if selected {
+        for r in 0..2u16 {
+            f.render_widget(
+                Paragraph::new(" ").style(Style::default().bg(theme.accent)),
+                Rect::new(area.x, area.y + r, 1, 1),
+            );
+        }
+    }
 
     let (title, title_is_auto) = match s.display_override.as_deref().or(s.ai_title.as_deref()) {
         Some(t) if !t.is_empty() => (t.to_string(), true),
         _ => (s.name.clone(), false),
     };
     let title_style = if title_is_auto {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+        Style::default().fg(theme.title_fallback).add_modifier(Modifier::ITALIC)
     };
 
     use ratatui::text::{Line, Span};
 
-    let accent = if selected { "▎" } else { " " };
-    let accent_style = if selected {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-
-    // Row 1: ▎ glyph  title
+    // Row 1: glyph + title
     let title_avail = area.width.saturating_sub(4) as usize;
     let title_truncated = truncate_ellipsis(&title, title_avail);
     let title_line = Line::from(vec![
-        Span::styled(accent, accent_style),
-        Span::styled(format!(" {glyph} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(format!("{glyph} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(title_truncated, title_style),
     ]);
     f.render_widget(
         Paragraph::new(title_line),
-        Rect::new(area.x, area.y, area.width, 1),
+        Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
     );
 
     // Row 2 (indented): status · time-ago
@@ -1633,12 +1646,12 @@ fn draw_sidebar_entry(
     let meta_line = Line::from(vec![
         Span::raw("    "),
         Span::styled(status_label, Style::default().fg(color)),
-        Span::styled(format!(" · {time_ago}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(exit_part, Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" · {time_ago}"), Style::default().fg(theme.dim)),
+        Span::styled(exit_part, Style::default().fg(theme.dim)),
     ]);
     f.render_widget(
         Paragraph::new(meta_line),
-        Rect::new(area.x, area.y + 1, area.width, 1),
+        Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(1), 1),
     );
 }
 
