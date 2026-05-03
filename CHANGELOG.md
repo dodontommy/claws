@@ -4,6 +4,16 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.2] — 2026-05-02
+
+### Fixed
+- The pulse on the `--dangerously-skip-permissions` `!` indicator was
+  invisible on the tokyo-night and mono themes because both define
+  `context_high == awaiting_a` (i.e. the v0.2.1 cycle was between two
+  identical colors). Now cycles between `context_high` and
+  `awaiting_b` (always distinct in every shipped theme) and toggles
+  `BOLD` as a belt-and-suspenders fallback.
+
 ## [0.2.1] — 2026-05-02
 
 ### UX

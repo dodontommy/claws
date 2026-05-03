@@ -32,14 +32,23 @@ const DANGEROUS_FLAG: &str = "--dangerously-skip-permissions";
 /// --dangerously-skip-permissions. Slower cadence than the awaiting-permission
 /// pulse (every 3 ticks vs every 2) so the two flavors of attention read as
 /// distinct things at a glance.
+///
+/// Cycles fg between `theme.context_high` and `theme.awaiting_b` AND toggles
+/// BOLD. Two-axis pulse is intentional: tokyo-night and mono themes have
+/// `context_high == awaiting_a`, so a single-color cycle would have no
+/// visible animation. awaiting_b is always distinct from context_high
+/// across our themes, and the BOLD toggle is a belt-and-suspenders fallback
+/// in case a future theme reuses awaiting_b for context_high too.
 fn danger_style_pulsed(tick_phase: u32) -> Style {
     let theme = crate::theme::current();
-    let color = if (tick_phase / 3) % 2 == 0 {
-        theme.context_high
+    let phase = (tick_phase / 3) % 2;
+    if phase == 0 {
+        Style::default()
+            .fg(theme.context_high)
+            .add_modifier(Modifier::BOLD)
     } else {
-        theme.awaiting_a
-    };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.awaiting_b)
+    }
 }
 
 pub async fn run() -> Result<()> {
