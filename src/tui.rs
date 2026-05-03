@@ -2,7 +2,8 @@ use crate::client;
 use crate::protocol::SessionInfo;
 use anyhow::Result;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -34,14 +35,14 @@ pub async fn run() -> Result<()> {
     // Deliberately no EnableMouseCapture: capturing mouse events disables
     // the terminal's native drag-to-select / copy-paste, which is the more
     // valuable interaction. Keyboard nav handles everything mouse used to.
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_inner(&mut terminal).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -323,6 +324,20 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<
                 match ev {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(key, &mut app).await
+                    }
+                    Some(Ok(Event::Paste(s))) => {
+                        // The terminal grouped a multi-line paste for us via
+                        // bracketed-paste mode. When attached, wrap the
+                        // payload in `\x1b[200~ ... \x1b[201~` so Claude
+                        // (which has its own bracketed-paste handling) sees
+                        // it as one block and doesn't submit on every \n.
+                        if let View::Attached { session_id, .. } = &app.view {
+                            let mut bytes = Vec::with_capacity(s.len() + 12);
+                            bytes.extend_from_slice(b"\x1b[200~");
+                            bytes.extend_from_slice(s.as_bytes());
+                            bytes.extend_from_slice(b"\x1b[201~");
+                            let _ = client::send_input_raw(*session_id, bytes).await;
+                        }
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
                     if let View::Attached { session_id, parser, .. } = &mut app.view {
