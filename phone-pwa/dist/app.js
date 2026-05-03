@@ -176,6 +176,8 @@ function sortSessions() {
 
 // ---- xterm integration ------------------------------------------------------
 
+let termOpened = false;
+
 function ensureTerminal() {
   if (term) return term;
   if (typeof Terminal === "undefined") {
@@ -220,12 +222,9 @@ function ensureTerminal() {
     fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
   }
-  term.open(termHost);
-  // Re-fit on viewport changes (rotation, keyboard show/hide, install banner).
-  window.addEventListener("resize", () => fitTerm());
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener("resize", () => fitTerm());
-  }
+  // term.open() is deferred to attachTerminalTo() — calling it while
+  // termHost is `hidden` (display: none) leaves xterm with zero-sized
+  // internal canvases and it never renders even after we unhide.
   return term;
 }
 
@@ -252,6 +251,18 @@ function attachTerminalTo(mount) {
   if (!t) return;
   termHost.hidden = false;
   if (termHost.parentElement !== mount) mount.appendChild(termHost);
+  // Open AFTER reparenting + unhiding so xterm measures real dimensions.
+  // Once opened, subsequent reparenting works because the internal DOM
+  // moves with termHost as a unit.
+  if (!termOpened) {
+    t.open(termHost);
+    termOpened = true;
+    // Re-fit on viewport changes (rotation, keyboard show/hide, etc).
+    window.addEventListener("resize", () => fitTerm());
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", () => fitTerm());
+    }
+  }
   // Defer fit until layout settles.
   requestAnimationFrame(() => {
     fitTerm();
