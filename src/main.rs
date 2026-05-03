@@ -9,6 +9,7 @@ mod git;
 mod hook;
 mod paths;
 mod persist;
+mod phone;
 mod pidfile;
 mod protocol;
 mod registry;
@@ -75,6 +76,34 @@ enum Command {
     },
     /// Check for and install the latest release.
     Update,
+    /// Phone companion (PWA over HTTP/WS) — start, pair, manage devices.
+    Phone {
+        #[command(subcommand)]
+        action: PhoneAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PhoneAction {
+    /// Start the phone listener (loopback only; front with Tailscale serve
+    /// or Cloudflared for HTTPS + cellular reach). Persists across restarts.
+    Start {
+        /// Bind address. Must be loopback in this version.
+        #[arg(long, default_value = "127.0.0.1:9817")]
+        bind: String,
+    },
+    /// Stop the phone listener and clear the persisted-enabled flag.
+    Stop,
+    /// Print listener status, bind URL, and device count.
+    Status,
+    /// Mint a pair code, print it + a QR for the URL the phone should open.
+    Pair,
+    /// List paired devices with id, label, paired-at, last-seen.
+    Devices,
+    /// Revoke a paired device by id (from `phone devices`).
+    Revoke {
+        device_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -133,8 +162,123 @@ fn main() -> Result<()> {
             Some(Command::Close { session_id }) => client::close_session(session_id).await,
             Some(Command::HookEmit { session, event }) => hook::run_hook_emit(session, event).await,
             Some(Command::Update) => run_update().await,
+            Some(Command::Phone { action }) => run_phone(action).await,
         }
     })
+}
+
+async fn run_phone(action: PhoneAction) -> Result<()> {
+    use serde_json::json;
+    match action {
+        PhoneAction::Start { bind } => {
+            let res = client::call("phone_start", json!({"bind": bind})).await?;
+            let bind = res.get("bind").and_then(|v| v.as_str()).unwrap_or("?");
+            if res.get("already_running").and_then(|v| v.as_bool()).unwrap_or(false) {
+                println!("phone listener already running on {bind}");
+            } else {
+                println!("phone listener up on http://{bind}");
+            }
+            println!("\nNext: front this with HTTPS for cellular reach. One of:");
+            println!("  tailscale serve --bg --https=443 http://{bind}");
+            println!("  cloudflared tunnel --url http://{bind}");
+            println!("\nThen run `claws phone pair` to add your phone.");
+            Ok(())
+        }
+        PhoneAction::Stop => {
+            let res = client::call("phone_stop", json!({})).await?;
+            if res.get("stopped").and_then(|v| v.as_bool()).unwrap_or(false) {
+                println!("phone listener stopped");
+            } else {
+                println!("(phone listener was not running)");
+            }
+            Ok(())
+        }
+        PhoneAction::Status => {
+            let res = client::call("phone_status", json!({})).await?;
+            let running = res.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+            let bind = res.get("bind").and_then(|v| v.as_str()).unwrap_or("-");
+            let dev = res.get("device_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("running:  {}", if running { "yes" } else { "no" });
+            println!("bind:     {bind}");
+            println!("devices:  {dev}");
+            Ok(())
+        }
+        PhoneAction::Pair => {
+            let res = client::call("phone_pair_code", json!({})).await?;
+            let code = res.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let bind = res.get("bind").and_then(|v| v.as_str()).unwrap_or("");
+            let url = format!("http://{bind}/#code={code}");
+            println!("Pair code: {code}");
+            println!("URL:       {url}");
+            println!("\nTTL: 10 minutes. Single use.\n");
+            print_qr(&url);
+            println!("\nIf you used `tailscale serve --https`, your phone should open");
+            println!("https://<your-machine>.<tailnet>.ts.net/#code={code}");
+            println!("instead of the http://localhost URL above.");
+            Ok(())
+        }
+        PhoneAction::Devices => {
+            let res = client::call("phone_devices", json!({})).await?;
+            let arr = res.as_array().cloned().unwrap_or_default();
+            if arr.is_empty() {
+                println!("(no paired devices)");
+                return Ok(());
+            }
+            println!("{:<38}  {:<24}  paired", "id", "label");
+            for d in arr {
+                let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+                let label = d
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unlabeled)");
+                let paired = d.get("paired_at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("{id:<38}  {label:<24}  {}", format_ts(paired));
+            }
+            Ok(())
+        }
+        PhoneAction::Revoke { device_id } => {
+            let res = client::call("phone_revoke", json!({"device_id": device_id})).await?;
+            if res.get("removed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                println!("revoked {device_id}");
+            } else {
+                println!("no device with id {device_id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn format_ts(ms: u64) -> String {
+    if ms == 0 {
+        return "-".to_string();
+    }
+    let secs = ms / 1000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dt = now.saturating_sub(secs);
+    if dt < 60 { format!("{dt}s ago") }
+    else if dt < 3600 { format!("{}m ago", dt / 60) }
+    else if dt < 86_400 { format!("{}h ago", dt / 3600) }
+    else { format!("{}d ago", dt / 86_400) }
+}
+
+fn print_qr(url: &str) {
+    use qrcode::{render::unicode, QrCode};
+    match QrCode::new(url.as_bytes()) {
+        Ok(q) => {
+            let s = q
+                .render::<unicode::Dense1x2>()
+                .quiet_zone(true)
+                .module_dimensions(1, 1)
+                .build();
+            println!("{s}");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "qr render failed; falling back to URL only");
+        }
+    }
 }
 
 async fn run_update() -> Result<()> {

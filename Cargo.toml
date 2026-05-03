@@ -36,6 +36,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Phone companion (PWA over HTTP/WS).
+# TLS for non-localhost binds is deferred — Phase 1 binds 127.0.0.1 and expects
+# the user to front it with `tailscale serve --https` or `cloudflared tunnel`,
+# both of which terminate TLS for us. Phase 4 will add a self-signed-cert mode
+# for users who want raw LAN binding without an external fronting service.
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
+qrcode = { version = "0.14", default-features = false }
+rand = "0.8"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
