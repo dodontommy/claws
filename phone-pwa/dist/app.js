@@ -4,6 +4,34 @@
 
 const TOKEN_KEY = "claws.deviceToken";
 const PUSH_FLAG_KEY = "claws.pushSubscribed";
+const THEME_KEY = "claws.theme";
+
+// Same theme set as the TUI (src/theme.rs). Order matters — the picker
+// renders in this order and matches the TUI's selection cycle.
+const THEMES = [
+  { name: "default",     label: "default" },
+  { name: "catppuccin",  label: "catppuccin mocha" },
+  { name: "tokyo-night", label: "tokyo night" },
+  { name: "nord",        label: "nord" },
+  { name: "mono",        label: "monochrome" },
+];
+
+function applyTheme(name) {
+  const known = THEMES.find((t) => t.name === name) ? name : "catppuccin";
+  document.documentElement.dataset.theme = known;
+  localStorage.setItem(THEME_KEY, known);
+  // Update the iOS Safari status-bar tint color in real time.
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+    if (bg) meta.setAttribute("content", bg);
+  }
+}
+
+function loadThemeAtBoot() {
+  applyTheme(localStorage.getItem(THEME_KEY) || "catppuccin");
+}
+loadThemeAtBoot();
 const $app = document.getElementById("app");
 
 const state = {
@@ -237,12 +265,18 @@ function ensureTerminal() {
 
 function fitTerm() {
   if (!fitAddon || !termHost || termHost.hidden) return;
-  // Deliberately do NOT send a resize to the daemon. The PTY is shared with
-  // any dev-box TUI viewers; resizing it from the phone causes Claude to
-  // redraw at the phone's geometry, which makes the dev TUI visibly thrash.
-  // We let xterm display whatever size the daemon's PTY currently is —
-  // padding/wrap on the phone is a fine trade-off for a stable shared view.
   try { fitAddon.fit(); } catch {}
+  // Tell the daemon our new viewport so it can resize OUR private parser
+  // (per-client virtual screen — no effect on the actual PTY or any other
+  // viewer). Daemon replies with a fresh state_formatted at the new size.
+  if (term && state.selectedId) {
+    sendWS({
+      kind: "resize",
+      session_id: state.selectedId,
+      rows: term.rows,
+      cols: term.cols,
+    });
+  }
 }
 
 // Persistent streaming UTF-8 decoder. Critical because PTY chunks can split
@@ -292,9 +326,21 @@ function attachTerminalTo(mount) {
     // Rotation will need a manual page reload to re-fit, which is a
     // worthwhile trade for typing actually working.
   }
-  // Defer fit until layout settles.
+  // Defer fit + subscribe until layout settles. We must subscribe AFTER
+  // fit so the rows/cols we report match what xterm actually renders;
+  // the daemon builds our private parser at exactly that size.
   requestAnimationFrame(() => {
-    fitTerm();
+    if (fitAddon) {
+      try { fitAddon.fit(); } catch {}
+    }
+    if (state.selectedId && state.ws && state.ws.readyState === 1) {
+      sendWS({
+        kind: "subscribe",
+        session_id: state.selectedId,
+        rows: term.rows,
+        cols: term.cols,
+      });
+    }
     t.scrollToBottom();
   });
 }
@@ -564,13 +610,14 @@ function renderPair() {
   $app.innerHTML = "";
   const root = el(`
     <div class="app">
-      <header><div class="title">claws</div></header>
+      <header><div class="brand">claws</div></header>
       <div class="view">
         <div class="pair">
-          <h1>Pair this device</h1>
-          <p>Open the QR or pairing link from <code>claws phone pair</code> on your dev box.</p>
-          <input id="code" placeholder="Pair code" value="${escapeHtml(code)}" autocapitalize="none" autocorrect="off" spellcheck="false" />
-          <button id="go">Pair</button>
+          <div class="pair-logo">▎ claws</div>
+          <h1>pair this device</h1>
+          <p>Run <code>claws phone pair</code> on your dev box and enter the code below — or scan the QR it prints to skip the typing.</p>
+          <input id="code" placeholder="pair code" value="${escapeHtml(code)}" autocapitalize="none" autocorrect="off" spellcheck="false" />
+          <button id="go">pair</button>
           ${state.pairError ? `<div class="err">${escapeHtml(state.pairError)}</div>` : ""}
         </div>
       </div>
@@ -597,9 +644,16 @@ function renderPair() {
 function renderList() {
   const conn = state.wsAlive ? "live" : "gone";
   const connText = state.wsAlive ? "live" : "offline";
+
+  // Aggregate status counts — same shape as the TUI's top bar (e.g. "3● 1◐ 1★").
+  const counts = { streaming: 0, awaiting_permission: 0, idle: 0, exited: 0 };
+  for (const s of state.sessions) {
+    if (counts[s.status] !== undefined) counts[s.status]++;
+  }
+
   const rows = state.sessions.map((s) => `
-    <div class="row" data-id="${escapeHtml(s.id)}">
-      <div class="dot ${escapeHtml(s.status)}"></div>
+    <div class="row ${escapeHtml(s.status)}" data-id="${escapeHtml(s.id)}">
+      <div class="marker"><span class="glyph">${statusGlyph(s.status)}</span></div>
       <div class="meta">
         <div class="name">${escapeHtml(displayName(s))}${s.dangerous ? '<span class="danger">!</span>' : ""}</div>
         <div class="sub">${escapeHtml(s.cwd)}</div>
@@ -607,11 +661,20 @@ function renderList() {
       <div class="state">${escapeHtml(stateLabel(s))}</div>
     </div>
   `).join("");
-  const empty = state.sessions.length ? "" : `<div class="empty">No sessions yet. Tap + to spawn one.</div>`;
+  const empty = state.sessions.length ? "" : `<div class="empty"><pre>╭───────────╮
+│  no       │
+│  sessions │
+╰───────────╯</pre>tap <strong>+</strong> to spawn one</div>`;
   const root = el(`
     <div class="app" id="app">
       <header>
-        <div class="title">claws</div>
+        <div class="brand">claws</div>
+        <div class="counts">
+          ${counts.streaming ? `<span class="c working"><span class="glyph">●</span> ${counts.streaming}</span>` : ""}
+          ${counts.awaiting_permission ? `<span class="c awaiting"><span class="glyph">★</span> ${counts.awaiting_permission}</span>` : ""}
+          ${counts.idle ? `<span class="c idle"><span class="glyph">◐</span> ${counts.idle}</span>` : ""}
+        </div>
+        <button class="hdr-btn" id="theme-btn" aria-label="Theme">t</button>
         <button class="hdr-btn" id="new-btn" aria-label="New session">+</button>
         <div class="conn ${conn}">${connText}</div>
       </header>
@@ -625,7 +688,69 @@ function renderList() {
     r.addEventListener("click", () => openSession(r.dataset.id));
   });
   root.querySelector("#new-btn").addEventListener("click", () => openSpawnSheet());
+  root.querySelector("#theme-btn").addEventListener("click", () => openThemeSheet());
   if (state.spawnOpen) renderSpawnSheet(root);
+  if (state.themeOpen) renderThemeSheet(root);
+}
+
+function openThemeSheet() {
+  state.themeOpen = true;
+  render();
+}
+
+function closeThemeSheet() {
+  state.themeOpen = false;
+  render();
+}
+
+function renderThemeSheet(root) {
+  const current = localStorage.getItem(THEME_KEY) || "catppuccin";
+  const sheet = el(`
+    <div class="sheet-backdrop">
+      <div class="sheet">
+        <div class="sheet-title">theme</div>
+        <div class="theme-list">
+          ${THEMES.map((t) => `
+            <button type="button" class="theme-row ${t.name === current ? "active" : ""}" data-theme="${t.name}">
+              <span class="marker">${t.name === current ? "›" : " "}</span>
+              <span class="label">${escapeHtml(t.label)}</span>
+              <span class="swatches" data-theme-preview="${t.name}">
+                <span class="sw sw-good"></span>
+                <span class="sw sw-warn"></span>
+                <span class="sw sw-bad"></span>
+                <span class="sw sw-accent"></span>
+                <span class="sw sw-cost"></span>
+              </span>
+            </button>
+          `).join("")}
+        </div>
+        <div class="sheet-actions">
+          <button class="sheet-cancel" id="theme-close">close</button>
+        </div>
+      </div>
+    </div>
+  `);
+  root.appendChild(sheet);
+  sheet.addEventListener("click", (e) => { if (e.target === sheet) closeThemeSheet(); });
+  sheet.querySelector("#theme-close").addEventListener("click", closeThemeSheet);
+  sheet.querySelectorAll(".theme-row").forEach((b) => {
+    b.addEventListener("click", () => {
+      applyTheme(b.dataset.theme);
+      closeThemeSheet();
+    });
+  });
+}
+
+function statusGlyph(status) {
+  switch (status) {
+    case "streaming": return "●";
+    case "awaiting_permission": return "★";
+    case "idle": return "◐";
+    case "spawning": return "◦";
+    case "exited": return "✓";
+    case "resume_failed": return "✗";
+    default: return "·";
+  }
 }
 
 function openSpawnSheet() {
@@ -661,12 +786,12 @@ function renderSpawnSheet(root) {
         <div class="model-row" id="sf-model">
           ${["default","opus","sonnet","haiku"].map((m) => `<button type="button" class="model-pill ${m === f.model ? "selected" : ""}" data-m="${m}">${m}</button>`).join("")}
         </div>
-        <label class="sheet-label">flags <span class="sheet-hint">(optional)</span></label>
-        <input class="sheet-input" id="sf-flags" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="--effort xhigh · --add-dir <path>" value="${escapeHtml(f.flags)}" />
+        <label class="sheet-label">flags <span class="sheet-hint">// optional</span></label>
+        <input class="sheet-input" id="sf-flags" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="--effort xhigh, --add-dir &lt;path&gt;" value="${escapeHtml(f.flags)}" />
         ${f.error ? `<div class="sheet-err">${escapeHtml(f.error)}</div>` : ""}
         <div class="sheet-actions">
-          <button class="sheet-cancel" id="sf-cancel">Cancel</button>
-          <button class="sheet-submit" id="sf-submit" ${f.submitting ? "disabled" : ""}>${f.submitting ? "Spawning…" : "Spawn"}</button>
+          <button class="sheet-cancel" id="sf-cancel">cancel</button>
+          <button class="sheet-submit" id="sf-submit" ${f.submitting ? "disabled" : ""}>${f.submitting ? "spawning…" : "spawn"}</button>
         </div>
       </div>
     </div>
@@ -738,7 +863,11 @@ function renderDetail() {
     <div class="app" id="app">
       <div class="detail-bar">
         <button class="back" aria-label="Back">←</button>
-        <div class="name">${escapeHtml(displayName(s))} · <span style="color:var(--muted);font-weight:400">${escapeHtml(stateLabel(s))}</span></div>
+        <div class="name">
+          ${escapeHtml(displayName(s))}
+          <span class="sep">·</span>
+          <span class="state-tag ${escapeHtml(s.status)}">${escapeHtml(stateLabel(s))}</span>
+        </div>
         <button class="menu" aria-label="Menu">⋯</button>
       </div>
       <div class="view">
@@ -795,7 +924,9 @@ function openSession(id) {
   state.view = "detail";
   state.ptyNextSeq = 0;
   resetTerminalForSession(id);
-  sendWS({ kind: "subscribe", session_id: id, since: 0 });
+  // The actual subscribe is sent in attachTerminalTo() once xterm has
+  // settled and we know our true rows/cols — those go to the daemon so
+  // it can build our private virtual screen at the right geometry.
   render();
 }
 

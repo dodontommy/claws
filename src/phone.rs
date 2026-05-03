@@ -537,12 +537,25 @@ async fn handle_ws(
     ws.on_upgrade(move |socket| handle_ws_socket(s, socket, device.id))
 }
 
+/// Per-WS-connection subscription state. Each phone client gets its OWN
+/// vt100 parser sized to its viewport, fed from the same byte stream
+/// Claude is producing on the daemon side. We emit screen serializations
+/// (state_formatted on subscribe/resize, state_diff on incremental ticks)
+/// so the phone xterm renders at *its* geometry — independent of what
+/// size the dev-box TUI has the actual PTY at. This is the multi-client
+/// model tmux uses.
+struct PhoneSub {
+    session_id: Uuid,
+    parser: vt100::Parser,
+    prev_screen: vt100::Screen,
+    ring_cursor: u64,
+}
+
 async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uuid) {
     let (mut tx, mut rx) = socket.split();
     use futures::{SinkExt, StreamExt};
 
-    // Per-connection subscription cursor for the currently-watched session.
-    let subscribed: Arc<Mutex<Option<(Uuid, u64)>>> = Arc::new(Mutex::new(None));
+    let subscribed: Arc<Mutex<Option<PhoneSub>>> = Arc::new(Mutex::new(None));
 
     // Snapshot push: every 500ms, send a sessions list. Real implementations
     // would push deltas via a broadcast channel sourced in `Session`; polling is
@@ -623,32 +636,47 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
             last_status.retain(|id, _| live.contains(id));
 
             // PTY tail for the subscribed session ----------------------------
-            let cur = { subscribed_for_snap.lock().await.clone() };
-            if let Some((sid, cursor)) = cur {
-                if let Some(sess) = state_for_snap.registry.get(sid) {
-                    let (bytes, next) = sess.read_output(cursor);
-                    if !bytes.is_empty() {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        let msg = json!({
-                            "kind": "session.output",
-                            "session_id": sid,
-                            "data_b64": b64,
-                            "next_seq": next,
-                        }).to_string();
-                        // Update cursor before send to avoid resending on a slow
-                        // consumer disconnect.
-                        {
-                            let mut g = subscribed_for_snap.lock().await;
-                            if let Some(c) = g.as_mut() {
-                                if c.0 == sid {
-                                    c.1 = next;
-                                }
+            // Pull new bytes since the last cursor we processed for this
+            // client, feed them through the client's PRIVATE parser at the
+            // phone's viewport geometry, then emit a state_diff that
+            // describes the visible screen at that geometry. Phone xterm
+            // renders the diff; result is "Claude's screen, sized for the
+            // phone" instead of "Claude's screen sized for whatever the
+            // dev TUI happens to have the PTY at".
+            let to_send: Option<(Uuid, Vec<u8>)> = {
+                let mut g = subscribed_for_snap.lock().await;
+                if let Some(sub) = g.as_mut() {
+                    if let Some(sess) = state_for_snap.registry.get(sub.session_id) {
+                        let (bytes, next) = sess.read_output(sub.ring_cursor);
+                        sub.ring_cursor = next;
+                        if !bytes.is_empty() {
+                            sub.parser.process(&bytes);
+                            let diff = sub.parser.screen().state_diff(&sub.prev_screen);
+                            if !diff.is_empty() {
+                                sub.prev_screen = sub.parser.screen().clone();
+                                Some((sub.session_id, diff))
+                            } else {
+                                None
                             }
+                        } else {
+                            None
                         }
-                        if out_tx_snap.send(msg).await.is_err() {
-                            return;
-                        }
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                }
+            };
+            if let Some((sid, diff)) = to_send {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
+                let msg = json!({
+                    "kind": "session.output",
+                    "session_id": sid,
+                    "data_b64": b64,
+                }).to_string();
+                if out_tx_snap.send(msg).await.is_err() {
+                    return;
                 }
             }
 
@@ -676,46 +704,42 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                 };
                 match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
                     "subscribe" => {
+                        // Spin up a per-client virtual screen sized to the
+                        // phone's viewport, replay the ring buffer through
+                        // it, and emit state_formatted as the initial paint.
+                        // Subsequent ticks emit state_diff (see snap_task).
+                        // The actual PTY size — and what the dev TUI sees —
+                        // is untouched.
                         let sid = v
                             .get("session_id")
                             .and_then(|x| x.as_str())
                             .and_then(|s| Uuid::parse_str(s).ok());
-                        // Default mode (`replay` absent or false): snapshot
-                        // the daemon's vt100 parser into a self-contained
-                        // ANSI sequence that recreates the *current* screen,
-                        // cursor, and modes in a fresh terminal — the same
-                        // way `tmux attach` works. Send that snapshot as
-                        // the first chunk, then stream live from the
-                        // cursor that was current when we took the snap.
-                        // This avoids the geometry-mismatch overlap that
-                        // raw ring-buffer replay produces, AND avoids the
-                        // black-flash of waiting for SIGWINCH to land.
-                        //
-                        // `replay: true` is an opt-in for tooling that
-                        // wants the raw byte history from `since`.
-                        let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(false);
+                        let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(24).max(4) as u16;
+                        let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(80).max(10) as u16;
                         if let Some(sid) = sid {
-                            if replay {
-                                let cursor = v.get("since").and_then(|x| x.as_u64()).unwrap_or(0);
-                                *subscribed.lock().await = Some((sid, cursor));
-                            } else if let Some(sess) = state.registry.get(sid) {
-                                let snap_bytes = sess.screen_replay();
-                                let cursor = sess.read_output(u64::MAX).1;
-                                *subscribed.lock().await = Some((sid, cursor));
-                                if !snap_bytes.is_empty() {
-                                    let b64 = base64::engine::general_purpose::STANDARD
-                                        .encode(&snap_bytes);
+                            if let Some(sess) = state.registry.get(sid) {
+                                let mut parser = vt100::Parser::new(rows, cols, 1000);
+                                let (history, end_cursor) = sess.read_output(0);
+                                if !history.is_empty() {
+                                    parser.process(&history);
+                                }
+                                let initial = parser.screen().state_formatted();
+                                let prev = parser.screen().clone();
+                                if !initial.is_empty() {
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&initial);
                                     let msg = json!({
                                         "kind": "session.output",
                                         "session_id": sid,
                                         "data_b64": b64,
-                                        "next_seq": cursor,
-                                    })
-                                    .to_string();
+                                    }).to_string();
                                     let _ = out_tx.send(msg).await;
                                 }
-                            } else {
-                                *subscribed.lock().await = Some((sid, 0));
+                                *subscribed.lock().await = Some(PhoneSub {
+                                    session_id: sid,
+                                    parser,
+                                    prev_screen: prev,
+                                    ring_cursor: end_cursor,
+                                });
                             }
                         }
                     }
@@ -738,29 +762,42 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                         }
                     }
                     "resize" => {
-                        let sid = v
-                            .get("session_id")
-                            .and_then(|x| x.as_str())
-                            .and_then(|s| Uuid::parse_str(s).ok());
+                        // Resize is per-client now: rebuild THIS phone's
+                        // private parser at the new geometry, replay the
+                        // ring through it, and emit a fresh state_formatted.
+                        // We deliberately do NOT touch the actual PTY —
+                        // doing so would yank the dev TUI's render geometry
+                        // out from under it. Per-client parsers are how
+                        // tmux solves this.
                         let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
                         let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-                        if let Some(sid) = sid {
-                            if rows >= 4 && cols >= 10 {
-                                if let Some(sess) = state.registry.get(sid) {
-                                    // Two-step resize: a same-size resize is
-                                    // a no-op as far as the child process is
-                                    // concerned, so it never gets SIGWINCH
-                                    // and never redraws. Briefly resizing to
-                                    // (rows-1, cols) then back to (rows, cols)
-                                    // forces two SIGWINCHes and Claude
-                                    // redraws the alt-screen into the new
-                                    // geometry — which is what we need on
-                                    // first subscribe to fill an empty xterm.
-                                    let bumped = rows.saturating_sub(1).max(4);
-                                    let _ = sess.resize(bumped, cols);
-                                    tokio::time::sleep(Duration::from_millis(30)).await;
-                                    let _ = sess.resize(rows, cols);
-                                }
+                        if rows >= 4 && cols >= 10 {
+                            let to_send: Option<(Uuid, Vec<u8>)> = {
+                                let mut g = subscribed.lock().await;
+                                if let Some(sub) = g.as_mut() {
+                                    if let Some(sess) = state.registry.get(sub.session_id) {
+                                        let mut parser = vt100::Parser::new(rows, cols, 1000);
+                                        let (history, end_cursor) = sess.read_output(0);
+                                        if !history.is_empty() {
+                                            parser.process(&history);
+                                        }
+                                        let fresh = parser.screen().state_formatted();
+                                        let prev = parser.screen().clone();
+                                        sub.parser = parser;
+                                        sub.prev_screen = prev;
+                                        sub.ring_cursor = end_cursor;
+                                        if fresh.is_empty() { None } else { Some((sub.session_id, fresh)) }
+                                    } else { None }
+                                } else { None }
+                            };
+                            if let Some((sid, fresh)) = to_send {
+                                let b64 = base64::engine::general_purpose::STANDARD.encode(&fresh);
+                                let msg = json!({
+                                    "kind": "session.output",
+                                    "session_id": sid,
+                                    "data_b64": b64,
+                                }).to_string();
+                                let _ = out_tx.send(msg).await;
                             }
                         }
                     }
