@@ -1,20 +1,16 @@
 # claws
 
-A terminal UI for running multiple Claude Code sessions at once. One window, all your sessions, switch between them with a keystroke.
+**The terminal where all your Claude Code sessions live.**
 
-If you've ever had three or four `claude` instances open in tmux panes and lost track of which one was waiting on you for a permission prompt, this fixes that.
+One window, every session, switch between them with a keystroke. No more tmux pane archaeology trying to find the one that's been waiting on a permission prompt for 15 minutes.
 
 ![claws dashboard](docs/screenshot.png)
 
-## What you get
+## Why
 
-A background daemon that owns each `claude` process inside its own PTY. A TUI client that connects to the daemon and shows all your sessions at once.
+`claude` is great. Running four of them in different tmux panes across three SSH sessions is *less* great. You miss prompts. You forget which one is in which directory. The one that finished an hour ago is buried under three windows of vim. You alt-tab to the wrong terminal and start typing into the working session.
 
-The dashboard has a sidebar of sessions on the left and a detail pane on the right. Each entry shows status (idle, working, needs you, exited), how long it's been running, and how recently it was active. The detail pane shows the last message, working directory, current branch (when in a git worktree), model, turn count, token usage, a rough cost estimate, and a context window fill bar.
-
-Hit Enter on a session and you're attached to its full Claude UI, same as if you'd run `claude` in a normal terminal. Ctrl-Space then `d` detaches you back to the dashboard. Sessions stay alive in the background while you're somewhere else.
-
-Press `g` to flip into a grid view — same data, laid out as a wall of session cards. Press `t` to open the theme picker (catppuccin, tokyo night, nord, default, mono — live preview as you arrow through). The top bar shows aggregate state counts (`3● 1◐ 1★`), so you can tell at a glance what every session in the daemon is doing.
+claws owns each `claude` process inside its own PTY and gives you one dashboard for all of them. Dots tell you which need you, which are working, which exited. Hit Enter, you're in. Ctrl-Space d, you're back. Sessions outlive your shell, your SSH connection, and your laptop's sleep cycle.
 
 ## Install
 
@@ -36,73 +32,120 @@ Windows (PowerShell):
 powershell -c "irm https://github.com/dodontommy/claws/releases/latest/download/claws-installer.ps1 | iex"
 ```
 
-You also need `claude` (the Claude Code CLI itself) on your PATH. claws spawns it as a subprocess.
+`claude` (the Claude Code CLI) needs to be on your `PATH` — claws spawns it. Run `claws` to open the dashboard, `claws update` to upgrade in place.
 
-Once installed, run `claws` to open the dashboard. Run `claws update` any time after that to pull the latest release in place.
+## What you get
 
-## Day-to-day use
+A small Rust daemon, a TUI client, and a clean separation: the daemon owns the processes, the client just renders.
 
-`c` opens a spawn form. The default cwd is your most-recently-active session's directory (so you usually just hit Enter to spawn another in the same workspace). As you type a path, the next matching subdirectory shows as ghost text after the cursor — Right-arrow at end of line accepts it. Tab cycles `directory → worktrees → flags → directory`.
+- **Sidebar with status at a glance.** `●` working · `◐` idle · `★` needs you · `✗` exited. The top bar aggregates: `3● 1◐ 1★`.
+- **Detail pane.** Last message, working directory, current branch (when in a git worktree), model, turn count, token usage, rough cost estimate, context window fill bar.
+- **Grid view.** Press `g`. Same data, laid out as a wall of cards. Useful when you have eight sessions and need to scan them all at once.
+- **Themes.** Press `t`. Catppuccin Macchiato, Tokyo Night, Nord, default, mono. Live preview as you arrow through; Esc reverts, Enter saves.
+- **Worktree-aware spawning.** New session form lists every worktree of the current repo. Pick one with arrow keys; Enter spawns into it. Or hit `[+ new worktree]` and we run `git worktree add` for you with sane defaults.
+- **Model picker on spawn.** Pill row: default · opus · sonnet · haiku. Pick one or just leave it on default.
+- **`mkdir -p` on spawn.** Type a path that doesn't exist yet, hit Enter — we create it before launching Claude there.
+- **SSH-friendly.** The daemon detaches from the controlling terminal at spawn. SSH disconnect doesn't kill it. Reconnect, run `claws` again, everything's still there.
+- **Resume across reboots.** On daemon startup we re-spawn every session you didn't explicitly close, with `claude --resume <session-id>` so the conversation history is intact.
+- **Bracketed paste.** Paste a multi-line snippet while attached — lands in Claude as one block instead of submitting on the first newline.
+- **Auth-protected RPCs.** Other local user accounts can't drive your daemon to spawn `claude` as you. Token rotates per daemon startup; socket directory is mode `0700`.
 
-If the directory is inside a git repo, the form lists every worktree of that repo. Pick one with the arrow keys + Enter to spawn into it directly. Or hit Enter on `[+ new worktree]` to open a sub-form that runs `git worktree add` for you (default branch name is the repo name with `-2`/`-3`/... appended to dedupe; default path is a sibling directory). If the cwd you typed already has a live session, claws warns you above the worktrees section and offers them as the obvious split.
+## Day-to-day
 
-In the flags field, type whatever you want to pass to `claude` (`--dangerously-skip-permissions`, `--system-prompt "be terse"`, `--effort xhigh`, `--add-dir`, anything). `Ctrl-Y` toggles `--dangerously-skip-permissions` if you don't feel like typing it. Sessions running with that flag get a red `!` in the sidebar so you don't lose track of which ones bypass permission prompts.
+Press `c` to spawn. The default cwd is your most-recently-active session's directory, so you usually just hit Enter to spawn another in the same workspace. Type a path; the next matching subdirectory shows as ghost text after your cursor — Right-arrow accepts it. Tab cycles `directory → worktrees → model → flags → directory`.
 
-`j`/`k` or arrow keys move between sessions in the sidebar. The detail pane updates to show the selected one. `Enter` attaches you to it. Double-click also attaches.
+In the flags field, type whatever you want to pass to `claude` — `--system-prompt "be terse"`, `--effort xhigh`, `--add-dir <path>`, anything. `Ctrl-Y` toggles `--dangerously-skip-permissions` if you don't feel like typing it out (and you'll know which sessions are running with it: red `!` in the sidebar so you don't lose track).
 
-While attached, `Ctrl-Space` is the prefix key (it works the way tmux's `Ctrl-b` does):
+Navigation:
 
-- `Ctrl-Space d` detaches back to the dashboard
-- `Ctrl-Space n` or `p` cycles to the next or previous session without going through the dashboard
-- `Ctrl-Space 1` through `9` jumps directly to session N
-- `Ctrl-Space [` enters scroll mode so you can read back through history
-- `?` on the dashboard opens the full keymap
+- `j`/`k` or arrows — move through the sidebar
+- `Enter` (or double-click) — attach to the selected session
+- `/` — filter sessions by name, cwd, or title
+- `i` — popup with the full last message + breakdown
+- `g` — toggle sidebar/grid
+- `t` — theme picker
+- `?` — full keymap
 
-Other things you'll want:
+Session management:
 
-- `r` renames a session. The renamed name overrides Claude's auto-generated title.
-- `R` kills and immediately resumes a session via `claude --resume`. Useful when Claude gets stuck mid-tool.
-- `x` closes and forgets the selected session. Sessions that fail to resume on daemon startup show up as `✗ resume failed` rows; `x` forgets them too.
-- `/` filters the list by name, working directory, or title.
-- `i` pops up a details view with the full last message and breakdown.
-- `g` toggles between sidebar and grid layout.
-- `t` opens the theme picker (live preview, esc reverts, enter saves).
+- `r` — rename. Renamed names override Claude's auto-generated titles.
+- `R` — kill and immediately `claude --resume`. Useful when Claude gets stuck mid-tool.
+- `x` — close and forget. Same key forgets `✗ resume failed` rows.
+- `q` — exit the TUI (the daemon stays running)
+
+## Attached mode
+
+While attached, `Ctrl-Space` is the prefix key. Same idea as tmux's `Ctrl-b`, just doesn't collide with shell line-edit:
+
+- `Ctrl-Space d` — detach back to the dashboard
+- `Ctrl-Space n` / `p` — cycle to the next/previous session without going through the dashboard
+- `Ctrl-Space 1`..`9` — jump directly to session N
+- `Ctrl-Space [` — enter scroll mode to read back through history
+
+Paste a multi-line snippet and it stays as one block. Forward-pass to Claude, no premature submit.
 
 ## SSH and persistence
 
-This part works the way you'd want. SSH into a server, run `claws`, spawn a few sessions, do some work, disconnect. Sessions keep running on the remote. Come back the next day, SSH back in, `claws` again, everything's still there.
+This part works the way you'd want. SSH in, run `claws`, spawn a few, do some work, disconnect. Sessions keep running on the remote. Come back tomorrow, SSH back in, `claws` again, everything's still there. The dashboard remembers what was active most recently, so the cursor lands somewhere useful.
 
-The daemon detaches from the controlling terminal at spawn (`setsid`), so SSH disconnects don't kill it. Its socket lives at `/tmp/claws-<uid>/sock`, which sticks around across logouts.
+The daemon's Unix socket lives at `/tmp/claws-<uid>/sock`. That path sticks around across logouts (intentionally — `XDG_RUNTIME_DIR` gets wiped by systemd-logind when your last session closes, which would orphan a still-running daemon).
 
-After a reboot the daemon is gone but the JSONL transcripts that Claude itself writes aren't. On next startup the daemon resumes every session that wasn't explicitly closed by you, calling `claude --resume <session-id>` so the conversation history is intact.
+After a reboot the daemon is gone but the JSONL transcripts Claude writes aren't. On next startup the daemon resumes everything you hadn't explicitly closed.
+
+## Configuration
+
+Pretty much none, by design. Default colors, keymap baked in, sensible behavior on a fresh install. Theme is the one persistent setting — picked once, remembered.
+
+Per-session settings (cwd, flags, name, model) survive across resumes via a small SQLite file in your local data directory. You don't manage it; it manages itself.
+
+If your custom Claude `statusLine` doesn't expose context-window fill in `<n>% used/total` format, claws falls back to estimating it from token counts and a built-in per-model context limit. Approximate, close enough.
 
 ## Stopping the daemon
 
-`q` exits the TUI but leaves the daemon and all sessions running. To actually stop everything:
+`q` exits the TUI but leaves the daemon and your sessions running. To actually stop everything:
 
 ```sh
 claws kill-server
 ```
 
-If the daemon is unresponsive (rare — used to happen with an auth-token race we fixed in v0.2.6, but the escape hatch is still nice to have), pass `--force` to PID-kill it:
+If the daemon is wedged (used to happen on rare auth-token races; v0.2.6 nailed the simultaneous-start case and v0.2.9 closed the late-start case), there's a force escape hatch:
 
 ```sh
 claws kill-server --force
 ```
 
-## Configuration
+That PID-kills the daemon process directly, bypassing the auth-protected shutdown RPC.
 
-There isn't really any. Default colors, keymap baked in, sensible behavior on a fresh install. Per-session settings live alongside the spawn (cwd, flags, name, model) and survive across resumes via a small SQLite file in your local data directory.
+## Architecture, briefly
 
-If your custom Claude statusLine doesn't expose context window fill in `<n>% used/total` format, claws will fall back to estimating it from token counts and a built-in per-model context limit. The number is approximate but close enough.
+```
+  ┌─────────────┐         ┌────────────┐
+  │  TUI client │ ──RPC──▶│  daemon    │──┬─ PTY ─▶ claude --session-id ...
+  └─────────────┘  unix   │            │  ├─ PTY ─▶ claude --resume ...
+        ▲         socket  │  registry  │  └─ PTY ─▶ claude --resume ...
+        │                 │  + state   │
+        │                 │  + auth    │
+        └─── attached ────┘
+              streaming
+```
 
-## Security
+The daemon is a long-lived process that owns the PTYs, parses each session's vt100 stream into an internal screen, persists session metadata to SQLite, and exposes a JSON-RPC API over a Unix socket. The TUI is a regular `claws` invocation that connects, lists sessions, and (when you attach) streams PTY bytes through.
 
-The daemon writes a fresh random auth token to its state directory at startup and rejects any RPC that doesn't include it. Both the Unix socket directory (mode 0700) and the Windows `%LOCALAPPDATA%` ACL keep that token unreadable to other local user accounts. So even on a shared machine, no one else can drive your daemon to spawn `claude` as you. Threat model is documented in [SECURITY.md](SECURITY.md).
+The RPC channel is symmetric: hooks emitted by Claude itself flow back through `claws hook-emit` into the same daemon, which is how the dashboard knows when a session enters `awaiting_permission` or finishes a tool call.
 
 ## Built with
 
-Rust. ratatui for the UI, portable-pty for cross-platform PTY spawning, vt100 for terminal emulation, interprocess for the local socket, rusqlite for the state store, axoupdater for the in-place updater.
+Rust. `ratatui` for the UI, `portable-pty` for cross-platform PTY spawning, `vt100` for terminal emulation, `interprocess` for the local socket, `rusqlite` for state, `axoupdater` for in-place updates.
+
+## What it doesn't do
+
+- It doesn't multiplex on the same `claude` process — each session is its own subprocess. Use Claude's own session-resume model for continuity within one conversation, and claws to manage *between* conversations.
+- It doesn't do shared multi-user access. The auth token is per-user; the socket is mode 0700. If you want a team-shared dashboard, that's a different tool.
+- It doesn't have a phone app yet. (There's a parked branch with a PWA, but iOS Safari's keyboard handling makes typing into a live terminal in a PWA hostile enough that it's on ice.)
+
+## Security
+
+The daemon rejects any RPC without the per-startup auth token. The socket directory is mode `0700` on Unix; on Windows it lives under `%LOCALAPPDATA%\claws\` whose default ACL restricts to the current user. Sessions running with `--dangerously-skip-permissions` get a red `!` in the sidebar to keep them visually distinct from gated ones. Threat model is documented in [SECURITY.md](SECURITY.md).
 
 ## License
 
