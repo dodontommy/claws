@@ -338,11 +338,12 @@ function renderList() {
       <div class="state">${escapeHtml(stateLabel(s))}</div>
     </div>
   `).join("");
-  const empty = state.sessions.length ? "" : `<div class="empty">No sessions yet. Spawn one from claws on your dev box.</div>`;
+  const empty = state.sessions.length ? "" : `<div class="empty">No sessions yet. Tap + to spawn one.</div>`;
   const root = el(`
     <div class="app" id="app">
       <header>
         <div class="title">claws</div>
+        <button class="hdr-btn" id="new-btn" aria-label="New session">+</button>
         <div class="conn ${conn}">${connText}</div>
       </header>
       <div class="view">
@@ -354,6 +355,100 @@ function renderList() {
   root.querySelectorAll(".row").forEach((r) => {
     r.addEventListener("click", () => openSession(r.dataset.id));
   });
+  root.querySelector("#new-btn").addEventListener("click", () => openSpawnSheet());
+  if (state.spawnOpen) renderSpawnSheet(root);
+}
+
+function openSpawnSheet() {
+  // Default cwd: the most recent session's cwd, or empty.
+  const recent = state.sessions[0]?.cwd || "";
+  state.spawnOpen = true;
+  state.spawnForm = {
+    cwd: recent,
+    model: "default",
+    flags: "",
+    submitting: false,
+    error: null,
+  };
+  render();
+}
+
+function closeSpawnSheet() {
+  state.spawnOpen = false;
+  state.spawnForm = null;
+  render();
+}
+
+function renderSpawnSheet(root) {
+  const f = state.spawnForm;
+  if (!f) return;
+  const sheet = el(`
+    <div class="sheet-backdrop">
+      <div class="sheet">
+        <div class="sheet-title">new session</div>
+        <label class="sheet-label">directory</label>
+        <input class="sheet-input" id="sf-cwd" autocapitalize="none" autocorrect="off" spellcheck="false" value="${escapeHtml(f.cwd)}" />
+        <label class="sheet-label">model</label>
+        <div class="model-row" id="sf-model">
+          ${["default","opus","sonnet","haiku"].map((m) => `<button type="button" class="model-pill ${m === f.model ? "selected" : ""}" data-m="${m}">${m}</button>`).join("")}
+        </div>
+        <label class="sheet-label">flags <span class="sheet-hint">(optional)</span></label>
+        <input class="sheet-input" id="sf-flags" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="--effort xhigh · --add-dir <path>" value="${escapeHtml(f.flags)}" />
+        ${f.error ? `<div class="sheet-err">${escapeHtml(f.error)}</div>` : ""}
+        <div class="sheet-actions">
+          <button class="sheet-cancel" id="sf-cancel">Cancel</button>
+          <button class="sheet-submit" id="sf-submit" ${f.submitting ? "disabled" : ""}>${f.submitting ? "Spawning…" : "Spawn"}</button>
+        </div>
+      </div>
+    </div>
+  `);
+  root.appendChild(sheet);
+  sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSpawnSheet(); });
+  sheet.querySelector("#sf-cancel").addEventListener("click", closeSpawnSheet);
+  sheet.querySelectorAll(".model-pill").forEach((p) => {
+    p.addEventListener("click", () => { f.model = p.dataset.m; render(); });
+  });
+  sheet.querySelector("#sf-cwd").addEventListener("input", (e) => { f.cwd = e.target.value; });
+  sheet.querySelector("#sf-flags").addEventListener("input", (e) => { f.flags = e.target.value; });
+  sheet.querySelector("#sf-submit").addEventListener("click", () => submitSpawn());
+}
+
+async function submitSpawn() {
+  const f = state.spawnForm;
+  if (!f || f.submitting) return;
+  if (!f.cwd.trim()) { f.error = "directory required"; render(); return; }
+  f.submitting = true;
+  f.error = null;
+  render();
+  // Naive flag split — same shell-words behavior would need a JS parser.
+  // A space-split is sufficient for the simple cases the user is likely
+  // to type on a phone; complex quoted args belong on the desktop.
+  const extra_args = f.flags.split(/\s+/).filter(Boolean);
+  const body = {
+    cwd: f.cwd,
+    model: f.model === "default" ? null : f.model,
+    extra_args,
+    create_cwd: true,
+  };
+  try {
+    const r = await fetch("/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(t || `spawn failed: ${r.status}`);
+    }
+    const info = await r.json();
+    closeSpawnSheet();
+    // Jump directly into the session we just created.
+    setTimeout(() => openSession(info.id), 100);
+  } catch (e) {
+    f.error = String(e.message || e);
+    f.submitting = false;
+    render();
+  }
 }
 
 function renderDetail() {

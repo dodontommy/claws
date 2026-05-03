@@ -145,7 +145,7 @@ pub fn save_state(s: &PhoneState) -> Result<()> {
 /// Shared state for axum handlers.
 pub struct AppState {
     registry: SessionRegistry,
-    _store: Store,
+    store: Store,
     /// In-memory pair codes. Single use, expire in PAIR_CODE_TTL.
     pair_codes: Mutex<HashMap<String, Instant>>,
     /// Persisted devices. We hold an `RwLock` over the whole `PhoneState` so
@@ -203,7 +203,7 @@ pub async fn start(
     let persisted = load_state();
     let app_state = Arc::new(AppState {
         registry,
-        _store: store,
+        store,
         pair_codes: Mutex::new(HashMap::new()),
         state: RwLock::new(persisted),
         failed_pair_count: Mutex::new((Instant::now(), 0)),
@@ -229,7 +229,8 @@ pub async fn start(
     let router = Router::new()
         .route("/api/pair", post(handle_pair))
         .route("/api/me", get(handle_me))
-        .route("/api/sessions", get(handle_sessions))
+        .route("/api/sessions", get(handle_sessions).post(handle_create_session))
+        .route("/api/sessions/:id/close", post(handle_close_session))
         .route("/api/ws", get(handle_ws))
         .route("/api/push/vapid_key", get(handle_vapid_key))
         .route("/api/push/subscribe", post(handle_push_subscribe))
@@ -400,6 +401,78 @@ async fn handle_sessions(
         .map(|sess| session_view(sess))
         .collect();
     Json(infos).into_response()
+}
+
+#[derive(Deserialize)]
+struct CreateSessionBody {
+    cwd: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    extra_args: Vec<String>,
+    #[serde(default)]
+    name: Option<String>,
+    /// If true and the cwd doesn't exist yet, mkdir -p before spawning —
+    /// mirrors the TUI spawn modal's "[enter to mkdir -p]" behavior.
+    #[serde(default)]
+    create_cwd: bool,
+}
+
+async fn handle_create_session(
+    State(s): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CreateSessionBody>,
+) -> Response {
+    if authenticate(&s, &headers, None).await.is_none() {
+        return unauth();
+    }
+    if body.create_cwd {
+        let p = std::path::PathBuf::from(&body.cwd);
+        if !p.is_dir() {
+            if let Err(e) = std::fs::create_dir_all(&p) {
+                return (StatusCode::BAD_REQUEST, format!("mkdir failed: {e}")).into_response();
+            }
+        }
+    }
+    let params = crate::protocol::CreateSessionParams {
+        cwd: body.cwd,
+        name: body.name,
+        model: body.model,
+        extra_args: body.extra_args,
+    };
+    match crate::daemon::create_session_into_registry(params, &s.registry, &s.store).await {
+        Ok(info) => Json(info).into_response(),
+        Err(crate::daemon::CreateError::InvalidParams(m)) => {
+            (StatusCode::BAD_REQUEST, m).into_response()
+        }
+        Err(crate::daemon::CreateError::Internal(m)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, m).into_response()
+        }
+    }
+}
+
+async fn handle_close_session(
+    State(s): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if authenticate(&s, &headers, None).await.is_none() {
+        return unauth();
+    }
+    let sid = match Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::BAD_REQUEST, "bad session id").into_response(),
+    };
+    match s.registry.remove(sid) {
+        Some(sess) => {
+            sess.close();
+            // Mark closed-by-user in the persistent store so we don't
+            // auto-resume it on the next daemon start. Errors are non-fatal.
+            let _ = s.store.mark_closed_by_user(sid);
+            (StatusCode::OK, "closed").into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 #[derive(Deserialize)]

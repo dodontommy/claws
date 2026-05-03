@@ -476,18 +476,38 @@ async fn handle_create(
     reg: &SessionRegistry,
     store: &Store,
 ) -> Response {
+    match create_session_into_registry(p, reg, store).await {
+        Ok(info) => ok(id, serde_json::to_value(info).unwrap()),
+        Err(CreateError::InvalidParams(m)) => err(id, RpcError::invalid_params(m)),
+        Err(CreateError::Internal(m)) => err(id, RpcError::internal(m)),
+    }
+}
+
+pub enum CreateError {
+    InvalidParams(String),
+    Internal(String),
+}
+
+/// Spawn a fresh session, persist it, insert it into the registry. Used by
+/// the unix-socket dispatch and by the phone module's HTTP `POST /api/sessions`.
+/// Both call sites share the same retry-and-persist logic this function owns.
+pub async fn create_session_into_registry(
+    p: CreateSessionParams,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> std::result::Result<SessionInfo, CreateError> {
     tracing::info!(cwd = %p.cwd, name = ?p.name, model = ?p.model, "create_session: begin");
     let cwd = PathBuf::from(&p.cwd);
     if !cwd.is_dir() {
-        return err(
-            id,
-            RpcError::invalid_params(format!("cwd does not exist or is not a directory: {}", p.cwd)),
-        );
+        return Err(CreateError::InvalidParams(format!(
+            "cwd does not exist or is not a directory: {}",
+            p.cwd
+        )));
     }
 
     let session_id = Uuid::new_v4();
     let settings_path = match hook::write_settings_for(session_id) {
-        Ok(p) => Some(p),
+        Ok(sp) => Some(sp),
         Err(e) => {
             tracing::warn!(error = %e, "failed to write hook settings; spawning without hooks");
             None
@@ -515,9 +535,9 @@ async fn handle_create(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::error!(error = ?e, "spawn_session failed");
-            return err(id, RpcError::internal(format!("spawn failed: {e:#}")));
+            return Err(CreateError::Internal(format!("spawn failed: {e:#}")));
         }
-        Err(e) => return err(id, RpcError::internal(format!("join failed: {e}"))),
+        Err(e) => return Err(CreateError::Internal(format!("join failed: {e}"))),
     };
     tracing::info!(session_id = %session.id, "create_session: spawn returned");
     let info = session_info(&session);
@@ -534,7 +554,7 @@ async fn handle_create(
     }
 
     reg.insert(session);
-    ok(id, serde_json::to_value(info).unwrap())
+    Ok(info)
 }
 
 async fn handle_list(id: u64, reg: &SessionRegistry) -> Response {
@@ -721,7 +741,7 @@ async fn handle_hook_event(id: u64, p: HookEventParams, reg: &SessionRegistry) -
     }
 }
 
-fn session_info(s: &Session) -> SessionInfo {
+pub fn session_info(s: &Session) -> SessionInfo {
     let snap = s.snapshot();
     let scraped = s.context_status();
     // Prefer scraped context (always reflects what Claude actually shows).
