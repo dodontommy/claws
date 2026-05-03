@@ -75,6 +75,15 @@ pub struct PhoneState {
     /// codes. Also auto-detected from `tailscale serve status` when missing.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Override the embedded PWA assets at runtime — when set, the static
+    /// asset handler reads HTML/JS/CSS from this directory first and only
+    /// falls back to the rust-embed bundle for missing files. The dev
+    /// loop becomes: edit `phone-pwa/dist/*`, refresh phone, see changes.
+    /// No `cargo install`, no `kill-server`, no session disruption.
+    /// Set with `claws phone start --pwa-dir <path>`. Persists across
+    /// daemon restarts; clear by passing an empty string.
+    #[serde(default)]
+    pub pwa_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +192,12 @@ impl PhoneHandle {
     pub async fn set_public_url(&self, url: String) {
         let mut g = self.state.state.write().await;
         g.public_url = Some(url);
+        let _ = save_state(&g);
+    }
+
+    pub async fn set_pwa_dir(&self, dir: Option<String>) {
+        let mut g = self.state.state.write().await;
+        g.pwa_dir = dir;
         let _ = save_state(&g);
     }
 
@@ -773,11 +788,36 @@ async fn touch_device(state: &Arc<AppState>, id: Uuid) {
     }
 }
 
-async fn handle_static(uri: Uri) -> Response {
+async fn handle_static(State(s): State<Arc<AppState>>, uri: Uri) -> Response {
     let mut path = uri.path().trim_start_matches('/').to_string();
     if path.is_empty() {
         path = "index.html".to_string();
     }
+    // Reject directory-traversal attempts; only flat or sub-path allowed.
+    if path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad path").into_response();
+    }
+
+    // Prefer the on-disk override directory when set; this is the dev-loop
+    // hot-reload path. We try the exact requested file first, then a
+    // wildcard-style fallback to index.html for SPA routing — same
+    // behaviour as the embedded path below.
+    let pwa_dir = s.state.read().await.pwa_dir.clone();
+    if let Some(dir) = pwa_dir.filter(|d| !d.is_empty()) {
+        let base = std::path::PathBuf::from(&dir);
+        let candidate = base.join(&path);
+        if let Ok(bytes) = tokio::fs::read(&candidate).await {
+            let mime = mime_guess::from_path(&candidate).first_or_octet_stream();
+            return (
+                [(header::CONTENT_TYPE, mime.essence_str().to_string())],
+                bytes,
+            )
+                .into_response();
+        }
+        // Override active but file missing → still try embedded as a fallback
+        // for assets that haven't been overridden (e.g. vendored xterm).
+    }
+
     if let Some(file) = PhoneAssets::get(&path) {
         let mime = mime_guess::from_path(&path).first_or_octet_stream();
         return ([(header::CONTENT_TYPE, mime.essence_str().to_string())], file.data.into_owned()).into_response();

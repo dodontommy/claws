@@ -91,6 +91,13 @@ enum PhoneAction {
         /// Bind address. Must be loopback in this version.
         #[arg(long, default_value = "127.0.0.1:9817")]
         bind: String,
+        /// Override the embedded PWA assets at runtime. When set, the static
+        /// handler reads HTML/JS/CSS from this directory first (falling back
+        /// to embedded for missing files). Edit, refresh phone, see changes
+        /// — no rebuild, no kill-server, no session disruption. Pass an
+        /// empty string to clear a previously-set override.
+        #[arg(long)]
+        pwa_dir: Option<String>,
     },
     /// Stop the phone listener and clear the persisted-enabled flag.
     Stop,
@@ -179,13 +186,25 @@ fn main() -> Result<()> {
 async fn run_phone(action: PhoneAction) -> Result<()> {
     use serde_json::json;
     match action {
-        PhoneAction::Start { bind } => {
-            let res = client::call("phone_start", json!({"bind": bind})).await?;
+        PhoneAction::Start { bind, pwa_dir } => {
+            let mut params = json!({"bind": bind});
+            if let Some(d) = pwa_dir.as_ref() {
+                params["pwa_dir"] = json!(d);
+            }
+            let res = client::call("phone_start", params).await?;
             let bind = res.get("bind").and_then(|v| v.as_str()).unwrap_or("?");
             if res.get("already_running").and_then(|v| v.as_bool()).unwrap_or(false) {
                 println!("phone listener already running on {bind}");
             } else {
                 println!("phone listener up on http://{bind}");
+            }
+            if let Some(d) = pwa_dir.as_ref() {
+                if d.is_empty() {
+                    println!("PWA override cleared — serving embedded assets.");
+                } else {
+                    println!("PWA hot-reload: serving from {d}");
+                    println!("(edit files there, refresh the phone — no restart needed)");
+                }
             }
             println!("\nNext: front this with HTTPS for cellular reach. One of:");
             println!("  tailscale serve --bg --https=443 http://{bind}");

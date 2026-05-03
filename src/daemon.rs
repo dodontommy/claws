@@ -377,9 +377,29 @@ async fn handle_phone_start(
         Ok(a) => a,
         Err(e) => return err(id, RpcError::invalid_params(e.to_string())),
     };
+    // Optional pwa_dir: persist immediately so it takes effect even if the
+    // listener is already running (the static handler reads it per-request).
+    // Empty string clears the override.
+    let pwa_dir_param = params.get("pwa_dir").and_then(|v| v.as_str());
+    if let Some(d) = pwa_dir_param {
+        let mut s = phone::load_state();
+        s.pwa_dir = if d.is_empty() { None } else { Some(d.to_string()) };
+        if let Err(e) = phone::save_state(&s) {
+            return err(id, RpcError::internal(format!("could not persist pwa_dir: {e:#}")));
+        }
+        // If the listener is up, push the new value into its in-memory state
+        // too so we don't have to wait for a daemon restart to read the
+        // freshly-persisted file.
+        if let Some(h) = handle.lock().await.as_ref() {
+            h.set_pwa_dir(s.pwa_dir.clone()).await;
+        }
+    }
     let mut g = handle.lock().await;
     if let Some(existing) = g.as_ref() {
-        return ok(id, json!({"already_running": true, "bind": existing.bind.to_string()}));
+        return ok(id, json!({
+            "already_running": true,
+            "bind": existing.bind.to_string()
+        }));
     }
     match phone::start(bind, registry.clone(), store.clone()).await {
         Ok(h) => {
