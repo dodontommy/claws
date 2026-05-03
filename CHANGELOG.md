@@ -4,6 +4,16 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.1] — 2026-05-02
+
+### UX
+- The red `!` indicator on sessions running with
+  `--dangerously-skip-permissions` now pulses (fg cycles between
+  `theme.context_high` and `theme.awaiting_a` every 3 ticks). Slower
+  cadence than the awaiting-permission pulse so the two flavors of
+  attention read as distinct things at a glance. Applies to the
+  sidebar, grid card title, and attached header.
+
 ## [0.2.0] — 2026-05-02
 
 ### Worktrees

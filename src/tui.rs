@@ -28,6 +28,20 @@ const ATTACHED_CHROME_ROWS: u16 = 2;
 // claude can run any tool without asking.
 const DANGEROUS_FLAG: &str = "--dangerously-skip-permissions";
 
+/// Pulsing style for the `!` indicator on sessions running with
+/// --dangerously-skip-permissions. Slower cadence than the awaiting-permission
+/// pulse (every 3 ticks vs every 2) so the two flavors of attention read as
+/// distinct things at a glance.
+fn danger_style_pulsed(tick_phase: u32) -> Style {
+    let theme = crate::theme::current();
+    let color = if (tick_phase / 3) % 2 == 0 {
+        theme.context_high
+    } else {
+        theme.awaiting_a
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -2621,7 +2635,7 @@ fn draw_sidebar_entry(
     } else {
         Style::default()
     };
-    let mut danger_style = Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD);
+    let mut danger_style = danger_style_pulsed(tick_phase);
     if tint {
         danger_style = danger_style.bg(theme.awaiting_bg);
     }
@@ -3104,7 +3118,7 @@ fn draw_card(
     if dangerous {
         title_spans.push(Span::styled(
             "  · !".to_string(),
-            Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD),
+            danger_style_pulsed(tick_phase),
         ));
     }
     title_spans.push(Span::raw(" "));
@@ -3436,7 +3450,7 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
         if s.extra_args.iter().any(|a| a == DANGEROUS_FLAG) {
             spans.push(Span::styled(
                 "  ·  !".to_string(),
-                Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD),
+                danger_style_pulsed(app.tick_phase),
             ));
         }
         Line::from(spans)
