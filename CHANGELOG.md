@@ -4,6 +4,19 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.10] — 2026-05-03
+
+### Added
+- Spawn form now has a model picker — pill row between worktrees and flags
+  with `default · opus · sonnet · haiku`. Left/Right arrows cycle when the
+  row is focused; the chosen value is passed to `claude --model`. `default`
+  means don't pass the flag and let claude pick.
+- Spawn form mkdir-on-submit: typing a directory that doesn't exist now
+  shows an italic `[enter to mkdir -p]` hint inline with the path. Enter
+  runs `mkdir -p` for you and proceeds with the spawn instead of refusing.
+- Tab order updated to follow the new visual top-to-bottom flow: directory
+  → worktrees (if inside a repo) → model → flags → directory.
+
 ## [0.2.9] — 2026-05-03
 
 ### Fixed

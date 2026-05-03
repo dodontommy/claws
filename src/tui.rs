@@ -69,6 +69,45 @@ enum FormField {
     Cwd,
     Args,
     Worktrees,
+    Model,
+}
+
+/// Pill choices for the spawn-form model selector. `Default` means "don't
+/// pass --model" — claude picks. The named variants map to claude's short
+/// model aliases (it also accepts full IDs, but the alias surface is the
+/// useful one for a one-keystroke picker).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelChoice {
+    Default,
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+impl ModelChoice {
+    const ALL: [ModelChoice; 4] = [
+        ModelChoice::Default,
+        ModelChoice::Opus,
+        ModelChoice::Sonnet,
+        ModelChoice::Haiku,
+    ];
+    fn label(&self) -> &'static str {
+        match self {
+            ModelChoice::Default => "default",
+            ModelChoice::Opus => "opus",
+            ModelChoice::Sonnet => "sonnet",
+            ModelChoice::Haiku => "haiku",
+        }
+    }
+    /// What we pass to `claude --model`. `None` means don't pass the flag.
+    fn as_arg(&self) -> Option<&'static str> {
+        match self {
+            ModelChoice::Default => None,
+            ModelChoice::Opus => Some("opus"),
+            ModelChoice::Sonnet => Some("sonnet"),
+            ModelChoice::Haiku => Some("haiku"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,6 +135,11 @@ enum Modal {
         /// Rendered as dim ghost text after the cursor. None when the typed
         /// path is already complete or has no unique completion candidate.
         cwd_completion: Option<String>,
+        /// True when `cwd` is non-empty and doesn't currently resolve to a
+        /// directory. We surface a "[Enter to create]" hint and mkdir -p on
+        /// submit instead of erroring.
+        cwd_missing: bool,
+        model: ModelChoice,
     },
     WorktreeNew {
         repo_root: PathBuf,
@@ -520,6 +564,7 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
         worktrees,
         wt_selected,
         cwd_completion,
+        model,
         ..
     }) = app.modal.as_mut()
     {
@@ -572,8 +617,14 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
                     app.set_status("cwd is empty".into());
                     return;
                 }
-                if !PathBuf::from(&cwd_v).is_dir() {
-                    app.set_status(format!("not a directory: {cwd_v}"));
+                let cwd_path = PathBuf::from(&cwd_v);
+                let mkdir_err = if !cwd_path.is_dir() {
+                    std::fs::create_dir_all(&cwd_path).err().map(|e| e.to_string())
+                } else {
+                    None
+                };
+                if let Some(e) = mkdir_err {
+                    app.set_status(format!("mkdir failed for {cwd_v}: {e}"));
                     return;
                 }
                 let extra: Vec<String> = match shell_words::split(args) {
@@ -583,8 +634,9 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
                         return;
                     }
                 };
+                let model_arg = model.as_arg().map(|s| s.to_string());
                 app.modal = None;
-                match client::create_session_raw(cwd_v.clone(), None, None, extra).await {
+                match client::create_session_raw(cwd_v.clone(), None, model_arg, extra).await {
                     Ok(_) => {
                         app.push_recent_cwd(cwd_v);
                         app.set_status("session created".into());
@@ -596,14 +648,25 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
             }
             (KeyCode::Tab, _) => {
                 let has_repo = repo_root.is_some();
-                // Match the visual order top-to-bottom: cwd → worktrees → flags → cwd.
+                // Visual top-to-bottom cycle: cwd → worktrees → model → flags → cwd.
                 // Skip worktrees if the cwd isn't inside a git repo.
                 *focus = match (*focus, has_repo) {
                     (FormField::Cwd, true) => FormField::Worktrees,
-                    (FormField::Cwd, false) => FormField::Args,
-                    (FormField::Worktrees, _) => FormField::Args,
+                    (FormField::Cwd, false) => FormField::Model,
+                    (FormField::Worktrees, _) => FormField::Model,
+                    (FormField::Model, _) => FormField::Args,
                     (FormField::Args, _) => FormField::Cwd,
                 };
+            }
+            (KeyCode::Left, _) if *focus == FormField::Model => {
+                let cur = ModelChoice::ALL.iter().position(|m| *m == *model).unwrap_or(0);
+                let next = if cur == 0 { ModelChoice::ALL.len() - 1 } else { cur - 1 };
+                *model = ModelChoice::ALL[next];
+            }
+            (KeyCode::Right, _) if *focus == FormField::Model => {
+                let cur = ModelChoice::ALL.iter().position(|m| *m == *model).unwrap_or(0);
+                let next = (cur + 1) % ModelChoice::ALL.len();
+                *model = ModelChoice::ALL[next];
             }
             (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
                 let flag = "--dangerously-skip-permissions";
@@ -670,7 +733,7 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
                 let (input, cursor) = match focus {
                     FormField::Cwd => (&mut *cwd, &mut *cwd_cursor),
                     FormField::Args => (&mut *args, &mut *args_cursor),
-                    FormField::Worktrees => return,
+                    FormField::Worktrees | FormField::Model => return,
                 };
                 handle_text_input(input, cursor, &key);
                 if *focus == FormField::Cwd && *cwd != cwd_was {
@@ -761,6 +824,8 @@ async fn handle_worktree_new_key(key: KeyEvent, app: &mut App) {
                     wt_selected: 0,
                     last_scan_cwd: String::new(),
                     cwd_completion: None,
+                    cwd_missing: false,
+                    model: ModelChoice::Default,
                 });
                 rescan_spawn_form(app);
                 app.set_status(format!("worktree '{b}' created at {p}"));
@@ -991,6 +1056,8 @@ async fn handle_dashboard_key(key: KeyEvent, app: &mut App) {
                 wt_selected: 0,
                 last_scan_cwd: String::new(),
                 cwd_completion: None,
+                cwd_missing: false,
+                model: ModelChoice::Default,
             });
             rescan_spawn_form(app);
         }
@@ -1283,6 +1350,8 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
             collision,
             wt_selected,
             cwd_completion,
+            cwd_missing,
+            model,
             ..
         } => draw_spawn_form(
             f,
@@ -1298,6 +1367,8 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
             *collision,
             *wt_selected,
             cwd_completion.as_deref(),
+            *cwd_missing,
+            *model,
         ),
         Modal::WorktreeNew {
             repo_root,
@@ -1713,6 +1784,8 @@ fn draw_spawn_form(
     collision: bool,
     wt_selected: usize,
     cwd_completion: Option<&str>,
+    cwd_missing: bool,
+    model: ModelChoice,
 ) {
     use ratatui::text::{Line, Span};
     let theme = crate::theme::current();
@@ -1738,6 +1811,8 @@ fn draw_spawn_form(
         CollisionBanner,
         WtLabel,
         WtList,
+        ModelLabel,
+        ModelPills,
         FlagsLabel,
         FlagsInput,
         SkipHint,
@@ -1763,6 +1838,9 @@ fn draw_spawn_form(
         plan.push((RowKind::WtLabel, 1));
         plan.push((RowKind::WtList, 1 + wt_count_shown));
     }
+    plan.push((RowKind::Pad, 1));
+    plan.push((RowKind::ModelLabel, 1));
+    plan.push((RowKind::ModelPills, 1));
     plan.push((RowKind::Pad, 1));
     plan.push((RowKind::FlagsLabel, 1));
     plan.push((RowKind::FlagsInput, 1));
@@ -1840,6 +1918,17 @@ fn draw_spawn_form(
                             ));
                         }
                     }
+                }
+                // Missing-directory hint: only when no completion is offered
+                // (the two would visually conflict). The hint colour matches
+                // the "needs you" warn palette so it reads as actionable.
+                if cwd_missing && cwd_completion.map(|s| s.is_empty()).unwrap_or(true) {
+                    spans.push(Span::styled(
+                        "  [enter to mkdir -p]".to_string(),
+                        Style::default()
+                            .fg(theme.context_high)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
                 }
                 f.render_widget(Paragraph::new(Line::from(spans)), area);
             }
@@ -1964,6 +2053,50 @@ fn draw_spawn_form(
                         Rect::new(area.x, y, area.width, 1),
                     );
                 }
+            }
+            RowKind::ModelLabel => {
+                f.render_widget(
+                    Paragraph::new("model").style(if focus == FormField::Model {
+                        label_active
+                    } else {
+                        label_dim
+                    }),
+                    area,
+                );
+            }
+            RowKind::ModelPills => {
+                let active_field = focus == FormField::Model;
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for (idx, m) in ModelChoice::ALL.iter().enumerate() {
+                    let selected = *m == model;
+                    let pill = format!(" {} ", m.label());
+                    let style = match (selected, active_field) {
+                        (true, true) => Style::default()
+                            .fg(theme.body)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                        (true, false) => Style::default()
+                            .fg(theme.title)
+                            .add_modifier(Modifier::BOLD),
+                        (false, _) => Style::default().fg(theme.dim),
+                    };
+                    spans.push(Span::styled(pill, style));
+                    if idx + 1 < ModelChoice::ALL.len() {
+                        spans.push(Span::styled("  ", Style::default().fg(theme.dim)));
+                    }
+                }
+                if active_field {
+                    spans.push(Span::styled("    ", Style::default().fg(theme.dim)));
+                    spans.push(Span::styled(
+                        "← →",
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        " cycle",
+                        Style::default().fg(theme.dim),
+                    ));
+                }
+                f.render_widget(Paragraph::new(Line::from(spans)), area);
             }
             RowKind::FlagsLabel => {
                 f.render_widget(
@@ -2680,6 +2813,7 @@ fn rescan_spawn_form(app: &mut App) {
         last_scan_cwd,
         wt_selected,
         cwd_completion,
+        cwd_missing,
         ..
     }) = app.modal.as_mut()
     {
@@ -2700,6 +2834,7 @@ fn rescan_spawn_form(app: &mut App) {
         *collision = sessions.iter().any(|s| paths_equal(&s.cwd, cwd));
         *wt_selected = 0;
         *cwd_completion = complete_path(cwd);
+        *cwd_missing = !cwd.trim().is_empty() && !cwd_path.is_dir();
     }
 }
 
