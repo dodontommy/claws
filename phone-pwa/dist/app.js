@@ -325,13 +325,20 @@ function attachTerminalTo(mount) {
     // adjustment — no xterm.fit, no resize message, so iOS focus on the
     // input proxy isn't disturbed.
     if (window.visualViewport) {
+      // Only listen to `resize` — keyboard show/hide is the resize event
+      // we care about. `scroll` fires continuously while iOS Safari's URL
+      // bar collapses/expands on touch-scroll, and updating the inset on
+      // each one made the layout jitter visibly. Threshold tiny deltas
+      // (URL-bar shimmies) so we only react to real keyboard transitions.
+      let lastInset = 0;
       const adjustForKeyboard = () => {
         const vv = window.visualViewport;
-        const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-        document.documentElement.style.setProperty("--keyboard-inset", `${offset}px`);
+        const inset = Math.max(0, window.innerHeight - vv.height);
+        if (Math.abs(inset - lastInset) < 50) return;
+        lastInset = inset;
+        document.documentElement.style.setProperty("--keyboard-inset", `${inset}px`);
       };
       window.visualViewport.addEventListener("resize", adjustForKeyboard);
-      window.visualViewport.addEventListener("scroll", adjustForKeyboard);
       adjustForKeyboard();
     }
   }

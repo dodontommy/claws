@@ -680,7 +680,12 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // Slower than the dev TUI tick. The phone is a passive viewer
+            // — sub-300ms diffs end up looking like jitter on a small
+            // screen because every tiny incremental scroll/redraw becomes
+            // a visible repaint. 300ms feels live enough for typing while
+            // smoothing out spinner-driven micro-updates.
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
     });
 
