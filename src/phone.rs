@@ -665,9 +665,30 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                             .get("session_id")
                             .and_then(|x| x.as_str())
                             .and_then(|s| Uuid::parse_str(s).ok());
-                        let since = v.get("since").and_then(|x| x.as_u64()).unwrap_or(0);
+                        // Two modes:
+                        //   replay=true  → start at `since` (or 0), dump the
+                        //                  whole ring buffer back. Useful for
+                        //                  tooling that wants raw history.
+                        //   replay=false → start at the daemon's *current*
+                        //                  cursor. The PWA uses this and
+                        //                  pairs it with a follow-up resize
+                        //                  that triggers SIGWINCH → Claude
+                        //                  redraws the alt-screen fresh into
+                        //                  our viewport instead of us
+                        //                  replaying TUI bytes that assumed
+                        //                  the daemon's original geometry.
+                        let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(false);
                         if let Some(sid) = sid {
-                            *subscribed.lock().await = Some((sid, since));
+                            let cursor = if replay {
+                                v.get("since").and_then(|x| x.as_u64()).unwrap_or(0)
+                            } else {
+                                state
+                                    .registry
+                                    .get(sid)
+                                    .map(|s| s.read_output(u64::MAX).1)
+                                    .unwrap_or(0)
+                            };
+                            *subscribed.lock().await = Some((sid, cursor));
                         }
                     }
                     "unsubscribe" => {
@@ -698,6 +719,18 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                         if let Some(sid) = sid {
                             if rows >= 4 && cols >= 10 {
                                 if let Some(sess) = state.registry.get(sid) {
+                                    // Two-step resize: a same-size resize is
+                                    // a no-op as far as the child process is
+                                    // concerned, so it never gets SIGWINCH
+                                    // and never redraws. Briefly resizing to
+                                    // (rows-1, cols) then back to (rows, cols)
+                                    // forces two SIGWINCHes and Claude
+                                    // redraws the alt-screen into the new
+                                    // geometry — which is what we need on
+                                    // first subscribe to fill an empty xterm.
+                                    let bumped = rows.saturating_sub(1).max(4);
+                                    let _ = sess.resize(bumped, cols);
+                                    tokio::time::sleep(Duration::from_millis(30)).await;
                                     let _ = sess.resize(rows, cols);
                                 }
                             }
