@@ -665,17 +665,18 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                             .get("session_id")
                             .and_then(|x| x.as_str())
                             .and_then(|s| Uuid::parse_str(s).ok());
-                        // Default to replaying from the requested `since`
-                        // (or 0 = the whole ring buffer). The buffer's TUI
-                        // bytes assume the daemon's previous geometry and
-                        // can look weird at the phone's size, but that's
-                        // visually preferable to an empty terminal that
-                        // depends on Claude noticing SIGWINCH. The follow-up
-                        // resize fires SIGWINCH anyway, so Claude will
-                        // redraw cleanly over the replay shortly after.
-                        // `replay: false` is an opt-out for tooling that
-                        // wants only post-subscribe bytes.
-                        let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(true);
+                        // Default = no replay. The follow-up resize fires
+                        // SIGWINCH which triggers Claude to redraw the
+                        // alt-screen at the phone's actual geometry, and
+                        // that redraw is what xterm renders. Replaying the
+                        // ring buffer first looks cleaner-than-empty for
+                        // a moment, but the buffer's bytes assume the
+                        // daemon's previous geometry and produce visible
+                        // garbage during the brief interval before the
+                        // redraw lands. ~50ms of empty xterm reads better
+                        // than 50ms of overlap. `replay: true` is an
+                        // opt-in for tooling that wants raw history.
+                        let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(false);
                         if let Some(sid) = sid {
                             let cursor = if replay {
                                 v.get("since").and_then(|x| x.as_u64()).unwrap_or(0)
