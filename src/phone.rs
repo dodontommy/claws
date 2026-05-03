@@ -665,19 +665,17 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                             .get("session_id")
                             .and_then(|x| x.as_str())
                             .and_then(|s| Uuid::parse_str(s).ok());
-                        // Two modes:
-                        //   replay=true  → start at `since` (or 0), dump the
-                        //                  whole ring buffer back. Useful for
-                        //                  tooling that wants raw history.
-                        //   replay=false → start at the daemon's *current*
-                        //                  cursor. The PWA uses this and
-                        //                  pairs it with a follow-up resize
-                        //                  that triggers SIGWINCH → Claude
-                        //                  redraws the alt-screen fresh into
-                        //                  our viewport instead of us
-                        //                  replaying TUI bytes that assumed
-                        //                  the daemon's original geometry.
-                        let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(false);
+                        // Default to replaying from the requested `since`
+                        // (or 0 = the whole ring buffer). The buffer's TUI
+                        // bytes assume the daemon's previous geometry and
+                        // can look weird at the phone's size, but that's
+                        // visually preferable to an empty terminal that
+                        // depends on Claude noticing SIGWINCH. The follow-up
+                        // resize fires SIGWINCH anyway, so Claude will
+                        // redraw cleanly over the replay shortly after.
+                        // `replay: false` is an opt-out for tooling that
+                        // wants only post-subscribe bytes.
+                        let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(true);
                         if let Some(sid) = sid {
                             let cursor = if replay {
                                 v.get("since").and_then(|x| x.as_u64()).unwrap_or(0)
