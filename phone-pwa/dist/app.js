@@ -1,4 +1,6 @@
 // claws phone PWA — vanilla single-file UI with Web Push + permission UI.
+// (The reset escape hatch lives inline in index.html so it works even
+// when this file is held hostage by a stale service worker cache.)
 
 const TOKEN_KEY = "claws.deviceToken";
 const PUSH_FLAG_KEY = "claws.pushSubscribed";
@@ -189,7 +191,7 @@ function ensureTerminal() {
     convertEol: false,
     cursorBlink: true,
     cursorStyle: "block",
-    disableStdin: true, // phone uses chips + input bar; xterm is read-only
+    disableStdin: false,
     scrollback: 5000,
     fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
     fontSize: 12,
@@ -225,17 +227,28 @@ function ensureTerminal() {
   // term.open() is deferred to attachTerminalTo() — calling it while
   // termHost is `hidden` (display: none) leaves xterm with zero-sized
   // internal canvases and it never renders even after we unhide.
+  // User input flows directly: xterm captures keystrokes, we forward
+  // each chunk to the daemon's session.send_input.
+  term.onData((data) => {
+    if (state.selectedId) sendKeys(data);
+  });
   return term;
 }
 
 function fitTerm() {
   if (!fitAddon || !termHost || termHost.hidden) return;
+  // Deliberately do NOT send a resize to the daemon. The PTY is shared with
+  // any dev-box TUI viewers; resizing it from the phone causes Claude to
+  // redraw at the phone's geometry, which makes the dev TUI visibly thrash.
+  // We let xterm display whatever size the daemon's PTY currently is —
+  // padding/wrap on the phone is a fine trade-off for a stable shared view.
   try { fitAddon.fit(); } catch {}
-  // Tell the daemon our new size so Claude's TUI re-renders to match.
-  if (term && state.selectedId) {
-    sendWS({ kind: "resize", session_id: state.selectedId, rows: term.rows, cols: term.cols });
-  }
 }
+
+// Persistent streaming UTF-8 decoder. Critical because PTY chunks can split
+// a multi-byte sequence across calls — non-streaming decode would emit a
+// U+FFFD replacement at the boundary and we'd lose the character.
+let utf8Decoder = null;
 
 function writePtyChunkToTerm(b64) {
   const t = ensureTerminal();
@@ -243,7 +256,18 @@ function writePtyChunkToTerm(b64) {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  t.write(bytes);
+  // Decode UTF-8 explicitly here and write as a string. xterm.js's
+  // Uint8Array path was producing double-encoded output (UTF-8 bytes
+  // rendered as if Latin-1 then re-encoded), turning ✻ into âœ» on
+  // screen. Decoding here and passing a string sidesteps that path.
+  if (!utf8Decoder) utf8Decoder = new TextDecoder("utf-8");
+  const text = utf8Decoder.decode(bytes, { stream: true });
+  t.write(text);
+}
+
+function resetUtf8Decoder() {
+  // Drop any pending partial sequence when switching sessions.
+  utf8Decoder = null;
 }
 
 function attachTerminalTo(mount) {
@@ -257,11 +281,13 @@ function attachTerminalTo(mount) {
   if (!termOpened) {
     t.open(termHost);
     termOpened = true;
-    // Re-fit on viewport changes (rotation, keyboard show/hide, etc).
-    window.addEventListener("resize", () => fitTerm());
-    if (window.visualViewport) {
-      window.visualViewport.addEventListener("resize", () => fitTerm());
-    }
+    // No window/visualViewport resize listener at all. iOS Safari fires
+    // `resize` (not just visualViewport.resize) when the keyboard shows,
+    // so any auto-fit ends up triggering an xterm relayout that steals
+    // focus from the active input and dismisses the keyboard. Initial
+    // fit happens on first attach; that's enough for our purposes.
+    // Rotation will need a manual page reload to re-fit, which is a
+    // worthwhile trade for typing actually working.
   }
   // Defer fit until layout settles.
   requestAnimationFrame(() => {
@@ -285,6 +311,7 @@ function resetTerminalForSession(id) {
   if (termSession !== id) {
     t.reset();
     termSession = id;
+    resetUtf8Decoder();
   }
 }
 
@@ -577,15 +604,15 @@ function renderDetail() {
         ${promptBlock}
         <div class="pty-mount" id="pty-mount"></div>
         <div class="chips">
-          <button class="chip" data-keys="\\r">⏎ Enter</button>
-          <button class="chip" data-keys="1">1</button>
-          <button class="chip" data-keys="2">2</button>
-          <button class="chip" data-keys="3">3</button>
           <button class="chip" data-keys="\\u001b">Esc</button>
           <button class="chip" data-keys="\\u001b[A">↑</button>
           <button class="chip" data-keys="\\u001b[B">↓</button>
           <button class="chip" data-keys="\\u0003">^C</button>
+          <button class="chip" data-keys="\\u0004">^D</button>
         </div>
+        <!-- Plain input bar. Trying to redirect into xterm on iOS Safari
+             tripped every iOS keyboard quirk known to humanity; a real
+             textarea that the user actually edits behaves correctly. -->
         <form class="input-bar" id="form">
           <textarea id="msg" rows="1" placeholder="Type and send…" autocapitalize="sentences"></textarea>
           <button type="submit">Send</button>
@@ -601,31 +628,54 @@ function renderDetail() {
     state.view = "list"; state.selectedId = null; render();
   });
   root.querySelectorAll(".chip, .prompt-btn").forEach((c) => {
-    c.addEventListener("click", () => sendKeys(decodeKeys(c.dataset.keys)));
+    c.addEventListener("click", () => {
+      // Keyboard chip focuses the password proxy synchronously in the
+      // click handler so iOS pops the keyboard.
+      if (c.dataset.action === "focus") {
+        const ta = document.getElementById("ptype");
+        if (ta) ta.focus({ preventScroll: true });
+        return;
+      }
+      sendKeys(decodeKeys(c.dataset.keys));
+    });
   });
+  // Plain input bar wiring. Tap Send (or hit Enter on a hardware keyboard)
+  // to submit. The textarea forwards its full value plus \r as one
+  // bracketed-paste-wrapped block on the daemon side, so multi-line
+  // paste survives intact instead of submitting on the first \n.
   const msg = root.querySelector("#msg");
-  // Auto-grow the textarea up to ~5 lines so multi-line paste is visible.
   const grow = () => {
     msg.style.height = "auto";
-    const max = 5 * 20; // ~5 lines at line-height 20px
-    msg.style.height = Math.min(msg.scrollHeight, max) + "px";
+    msg.style.height = Math.min(msg.scrollHeight, 5 * 22) + "px";
   };
   msg.addEventListener("input", grow);
-  // Enter inserts a newline (mobile keyboards have no Shift); Send tap submits.
-  // Don't let stray Enter keys submit the form.
+  // On mobile keyboards Enter inserts a newline; we keep that behaviour
+  // (Enter ≠ Send on phone) and the user taps the Send button to commit.
+  // On desktop hardware Cmd/Ctrl-Enter sends.
   msg.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
-      // Default textarea behaviour — newline. Just stop the form from submitting.
-      e.stopPropagation();
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submitMsg();
     }
   });
-  root.querySelector("#form").addEventListener("submit", (e) => {
+  const form = root.querySelector("#form");
+  form.addEventListener("submit", (e) => {
     e.preventDefault();
+    submitMsg();
+  });
+  function submitMsg() {
     const v = msg.value;
+    if (!v) return;
     msg.value = "";
     msg.style.height = "auto";
     sendKeys(v + "\r");
-  });
+  }
+  // Tapping the terminal area focuses the proxy synchronously inside the
+  // touch handler so iOS pops the keyboard.
+  const ptyMount = document.getElementById("pty-mount");
+  const focusInput = () => ptype.focus({ preventScroll: true });
+  ptyMount.addEventListener("touchstart", focusInput, { passive: true });
+  ptyMount.addEventListener("mousedown", focusInput);
 }
 
 function decodeKeys(s) {

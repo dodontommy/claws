@@ -95,11 +95,15 @@
     display: flex; gap: 6px; padding: 8px;
     background: var(--bg2); border-top: 1px solid var(--line);
   }
-  .input-bar input {
+  .input-bar input,
+  .input-bar textarea {
     flex: 1; background: var(--panel); border: 1px solid var(--line); color: var(--fg);
     border-radius: 8px; padding: 10px 12px; outline: none; min-width: 0;
+    font: 14px ui-sans-serif, system-ui, sans-serif;
+    resize: none; line-height: 1.4;
   }
-  .input-bar input:focus { border-color: var(--accent); }
+  .input-bar input:focus,
+  .input-bar textarea:focus { border-color: var(--accent); }
   .input-bar button {
     background: var(--accent); color: var(--bg); border: none; border-radius: 8px;
     padding: 10px 14px; font-weight: 600;
@@ -110,6 +114,25 @@
     padding: 6px 12px; border-radius: 16px; font-size: 13px; white-space: nowrap;
   }
   .chip:active { background: var(--line); }
+
+  /* iOS input proxy. type=password sidesteps iOS IME completion (see
+     xterm.js#2403). Pinned to the top of the viewport at 1px size so
+     iOS doesn't scroll/transform layout when summoning the keyboard —
+     the input is already in view, no adjustment needed. Invisible to
+     the user; the keystroke pipe is purely functional. */
+  .ptype-form { margin: 0; position: absolute; top: 0; left: 0; pointer-events: none; }
+  .ptype {
+    position: fixed; top: 0; left: 0;
+    width: 1px; height: 1px;
+    border: none; outline: none; padding: 0; margin: 0;
+    background: transparent; color: transparent;
+    /* font-size: 16px prevents iOS from auto-zooming on focus. */
+    font-size: 16px;
+    opacity: 0;
+    pointer-events: auto;
+    -webkit-appearance: none;
+    z-index: 1;
+  }
 
   /* Permission prompt banner — shown above the PTY when status is awaiting_permission. */
   .prompt-banner {
@@ -184,6 +207,30 @@
 </style>
 </head>
 <body>
+<!-- Self-nuke. Visit `?reset=1` to unregister the service worker and
+     drop all caches before any other script loads. Lives inline because
+     a stale cached app.js would otherwise prevent its own replacement. -->
+<script>
+  (function () {
+    if (!new URL(location.href).searchParams.get("reset")) return;
+    document.body.innerText = "resetting…";
+    (async () => {
+      try {
+        if ("serviceWorker" in navigator) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        }
+        if (window.caches) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+      } catch (e) { /* best effort */ }
+      location.replace("/");
+    })();
+    // Halt the rest of body parsing — the unregister + reload finishes the job.
+    throw new Error("claws PWA reset");
+  })();
+</script>
 <div id="app" class="app"></div>
 <!-- xterm.js terminal host. Lives outside #app so the rerender loop in
      app.js doesn't tear down its DOM (xterm manages its own internals

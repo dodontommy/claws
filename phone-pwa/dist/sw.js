@@ -1,6 +1,14 @@
 // claws phone — service worker. Offline shell + Web Push handler.
+//
+// Cache strategy:
+//   - Our own HTML/JS/CSS/manifest: network-first. We're iterating fast;
+//     cache-first locks users on stale code and the service worker never
+//     sees our updates.
+//   - Vendored third-party assets (/vendor/*): cache-first. xterm.js etc.
+//     don't change between deploys; serving from cache is faster.
+//   - /api/*: never cache, always live.
 
-const CACHE = "claws-shell-v2";
+const CACHE = "claws-shell-v3";
 const SHELL = ["/", "/index.html", "/app.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
@@ -20,25 +28,29 @@ self.addEventListener("fetch", (e) => {
   if (url.origin !== location.origin) return;
   // Never cache API/WS — always live.
   if (url.pathname.startsWith("/api/")) return;
-  // Network-first for HTML so deploys take effect immediately.
-  if (e.request.mode === "navigate" || url.pathname === "/" || url.pathname.endsWith(".html")) {
+
+  // Vendored third-party assets: cache-first (immutable between deploys).
+  if (url.pathname.startsWith("/vendor/")) {
     e.respondWith((async () => {
+      const cached = await caches.match(e.request);
+      if (cached) return cached;
       try {
         const resp = await fetch(e.request);
-        const c = await caches.open(CACHE);
-        c.put(e.request, resp.clone());
+        if (resp.ok) {
+          const c = await caches.open(CACHE);
+          c.put(e.request, resp.clone());
+        }
         return resp;
       } catch {
-        const cached = await caches.match(e.request);
-        return cached || caches.match("/index.html");
+        return cached || new Response("offline", { status: 503 });
       }
     })());
     return;
   }
-  // Cache-first for static assets.
+
+  // Everything else (HTML, our app.js, manifest, icon): network-first.
+  // Cache fallback only when offline. Means edits land on the next refresh.
   e.respondWith((async () => {
-    const cached = await caches.match(e.request);
-    if (cached) return cached;
     try {
       const resp = await fetch(e.request);
       if (resp.ok) {
@@ -47,7 +59,11 @@ self.addEventListener("fetch", (e) => {
       }
       return resp;
     } catch {
-      return cached || new Response("offline", { status: 503 });
+      const cached = await caches.match(e.request);
+      if (cached) return cached;
+      // Last-resort SPA fallback for navigations.
+      if (e.request.mode === "navigate") return caches.match("/index.html");
+      return new Response("offline", { status: 503 });
     }
   })());
 });
