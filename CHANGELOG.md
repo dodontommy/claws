@@ -4,6 +4,14 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.3] — 2026-05-02
+
+### Reverted
+- Reverted the pulsing `!` indicator from v0.2.1/v0.2.2. The static red
+  bold `!` from v0.2.0 is back. The pulse turned out subtle enough that
+  it didn't earn its complexity, and "border pulse" is a different and
+  bigger UX call we're not making yet.
+
 ## [0.2.2] — 2026-05-02
 
 ### Fixed

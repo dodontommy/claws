@@ -28,28 +28,6 @@ const ATTACHED_CHROME_ROWS: u16 = 2;
 // claude can run any tool without asking.
 const DANGEROUS_FLAG: &str = "--dangerously-skip-permissions";
 
-/// Pulsing style for the `!` indicator on sessions running with
-/// --dangerously-skip-permissions. Slower cadence than the awaiting-permission
-/// pulse (every 3 ticks vs every 2) so the two flavors of attention read as
-/// distinct things at a glance.
-///
-/// Cycles fg between `theme.context_high` and `theme.awaiting_b` AND toggles
-/// BOLD. Two-axis pulse is intentional: tokyo-night and mono themes have
-/// `context_high == awaiting_a`, so a single-color cycle would have no
-/// visible animation. awaiting_b is always distinct from context_high
-/// across our themes, and the BOLD toggle is a belt-and-suspenders fallback
-/// in case a future theme reuses awaiting_b for context_high too.
-fn danger_style_pulsed(tick_phase: u32) -> Style {
-    let theme = crate::theme::current();
-    let phase = (tick_phase / 3) % 2;
-    if phase == 0 {
-        Style::default()
-            .fg(theme.context_high)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.awaiting_b)
-    }
-}
 
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
@@ -2644,7 +2622,7 @@ fn draw_sidebar_entry(
     } else {
         Style::default()
     };
-    let mut danger_style = danger_style_pulsed(tick_phase);
+    let mut danger_style = Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD);
     if tint {
         danger_style = danger_style.bg(theme.awaiting_bg);
     }
@@ -3127,7 +3105,7 @@ fn draw_card(
     if dangerous {
         title_spans.push(Span::styled(
             "  · !".to_string(),
-            danger_style_pulsed(tick_phase),
+            Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD),
         ));
     }
     title_spans.push(Span::raw(" "));
@@ -3459,7 +3437,7 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
         if s.extra_args.iter().any(|a| a == DANGEROUS_FLAG) {
             spans.push(Span::styled(
                 "  ·  !".to_string(),
-                danger_style_pulsed(app.tick_phase),
+                Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD),
             ));
         }
         Line::from(spans)
