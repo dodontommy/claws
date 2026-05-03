@@ -137,11 +137,34 @@ The RPC channel is symmetric: hooks emitted by Claude itself flow back through `
 
 Rust. `ratatui` for the UI, `portable-pty` for cross-platform PTY spawning, `vt100` for terminal emulation, `interprocess` for the local socket, `rusqlite` for state, `axoupdater` for in-place updates.
 
+## Phone companion
+
+A real phone app, as of v0.3.0. PWA (no App Store, no install pipeline) that pairs to your daemon over Tailscale or any HTTPS fronting service. Once paired, you have:
+
+- Live status of every session in your daemon
+- Push notifications when one enters `awaiting_permission` or exits — pings your phone even when the app is closed
+- One-tap Allow / Always-allow / Deny when a permission prompt fires
+- Full xterm rendering of Claude's TUI, sized to your phone (per-client virtual screens, same model tmux uses)
+- Real keyboard typing into a live session
+- Spawn-from-phone with cwd, model picker, flags, and optional `mkdir -p`
+- Theme picker matching the TUI's themes (default, catppuccin, tokyo night, nord, mono)
+
+To set up:
+
+```sh
+# on your dev box, once
+tailscale serve --bg --https=443 http://127.0.0.1:9817
+claws phone start
+claws phone pair --url https://<your-machine>.<your-tailnet>.ts.net
+```
+
+Scan the QR on your phone, install to home screen, allow notifications. Future `claws phone pair` runs reuse the saved URL — no flag needed.
+
 ## What it doesn't do
 
 - It doesn't multiplex on the same `claude` process — each session is its own subprocess. Use Claude's own session-resume model for continuity within one conversation, and claws to manage *between* conversations.
 - It doesn't do shared multi-user access. The auth token is per-user; the socket is mode 0700. If you want a team-shared dashboard, that's a different tool.
-- It doesn't have a phone app yet. (There's a parked branch with a PWA, but iOS Safari's keyboard handling makes typing into a live terminal in a PWA hostile enough that it's on ice.)
+- The phone PWA is iOS-Safari-tested; Android Chrome should work in principle (Web Push, service worker, visualViewport are all standard) but isn't verified.
 
 ## Security
 

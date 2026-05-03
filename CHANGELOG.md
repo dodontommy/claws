@@ -4,6 +4,71 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-05-03
+
+### Added — phone companion (PWA)
+
+A real phone app for claws. Pair via QR over Tailscale (or Cloudflared, or
+any HTTPS fronting service), open the URL on your phone, install to home
+screen. The PWA gives you live status of every session in your daemon,
+push notifications when one needs you, a one-tap allow/deny for permission
+prompts, full xterm-rendered terminal output, real keyboard typing into
+attached sessions, and a spawn form mirroring the TUI's `c` modal.
+
+- **Live session list**, status counts, theme picker matching the TUI
+  (default, catppuccin mocha, tokyo night, nord, monochrome). Persisted
+  per-device via localStorage.
+- **xterm.js terminal** rendering Claude's TUI at the phone's geometry
+  via per-client virtual screens — each phone connection holds its own
+  vt100 parser fed from the same byte stream, plus a real PTY resize so
+  Claude itself draws for the phone (tmux's multi-client model).
+- **iOS keyboard input** that actually works. Uses Ace editor's
+  textinput pattern (Cloud9 / Replit mobile): a 1×1 fixed-position
+  textarea whose value cycles between a placeholder and
+  placeholder+keystrokes, never empty. Sidesteps every iOS Safari
+  keyboard-dismissal trigger we hit (and we hit them all).
+- **Web Push** with VAPID keys generated lazily on first start. The
+  daemon fans out a notification when any session enters
+  `awaiting_permission` or exits — phone pings even when the app is
+  closed. Tap to deep-link straight to that session.
+- **Permission prompt banner** with `1 / 2 / 3` quick-action buttons
+  for the common Allow / Always-allow / Deny choice.
+- **Spawn-from-phone bottom-sheet** mirroring the TUI's spawn modal:
+  cwd, model picker (default · opus · sonnet · haiku), flags. Optional
+  `mkdir -p` if the directory doesn't exist yet.
+- **Tailscale auto-detection** for the pair-code QR. Run
+  `tailscale serve --bg --https=443 http://127.0.0.1:9817`, then
+  `claws phone pair` finds the matching tailnet hostname and encodes
+  the right URL into the QR. Persisted with `--url`.
+- **`--pwa-dir`** for hot-reloading PWA assets without `kill-server`.
+  Edit a JS/HTML/CSS file in `phone-pwa/dist/`, refresh the phone, see
+  changes — daemon stays up, sessions undisturbed.
+
+### Added — TUI
+
+- Bracketed paste mode is now enabled (v0.2.11). Multi-line paste while
+  attached lands in Claude as one block instead of submitting on the
+  first newline.
+
+### CLI
+
+- `claws phone start [--bind ADDR] [--pwa-dir PATH]`
+- `claws phone pair [--url HTTPS_URL]` — prints code + QR, persists URL
+- `claws phone status | stop | devices | revoke <id>`
+
+### Known limitations
+
+- The phone PWA's typing uses a real `<input>` overlay (Ace's iOS
+  textinput pattern) — characters echo back through xterm because
+  Claude responds in the PTY, not because the input is local-echo.
+- Multi-client cost: while the phone is attached, the dev-TUI viewing
+  the same session sees Claude redraw at the phone's geometry. Detach
+  the phone (or resize the dev terminal) and the dev TUI's preferred
+  size returns. Same tradeoff as `tmux attach` from a smaller window.
+- iOS Safari only — no Android Chrome testing yet, though it should
+  work in principle (Web Push, service worker, visualViewport are all
+  standard).
+
 ## [0.2.11] — 2026-05-03
 
 ### Fixed
