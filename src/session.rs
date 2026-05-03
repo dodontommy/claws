@@ -225,6 +225,14 @@ fn pty_reader_loop(
                 s.ring.append(&buf[..n]);
                 s.parser.process(&buf[..n]);
                 s.last_activity = SystemTime::now();
+                // PTY bytes flowing => claude is alive. The SessionStart hook
+                // is the canonical Spawning→Idle trigger, but custom Claude
+                // builds, missing hook configs, or slow first frames can mean
+                // we never get one. Treat any byte from the child as proof of
+                // life and promote out of Spawning here as a fallback.
+                if matches!(s.status, SessionStatus::Spawning) {
+                    s.status = SessionStatus::Idle;
+                }
             }
             Err(e) => {
                 tracing::debug!(error = %e, "pty reader closing");
@@ -551,11 +559,19 @@ impl Session {
             "PostToolUse" | "PostToolUseFailure" => {
                 s.current_tool = None;
             }
-            "Notification" | "PermissionRequest" => {
+            "PermissionRequest" => {
                 s.status = SessionStatus::AwaitingPermission;
                 if let Some(tool) = payload.get("tool_name").and_then(|v| v.as_str()) {
                     s.current_tool = Some(tool.to_string());
                 }
+            }
+            "Notification" => {
+                // Notification fires for many non-permission things (info
+                // messages, completion notices) and doesn't get a follow-up
+                // Stop, so treating it as "awaiting permission" leaves rows
+                // stuck on "needs you" forever. Only PermissionRequest is
+                // the real signal — anything else is just noise we record
+                // for activity timestamps.
             }
             "Stop" => {
                 if !matches!(s.status, SessionStatus::Exited(_)) {

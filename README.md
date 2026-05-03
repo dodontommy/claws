@@ -4,6 +4,8 @@ A terminal UI for running multiple Claude Code sessions at once. One window, all
 
 If you've ever had three or four `claude` instances open in tmux panes and lost track of which one was waiting on you for a permission prompt, this fixes that.
 
+![claws dashboard](docs/screenshot.png)
+
 ## What you get
 
 A background daemon that owns each `claude` process inside its own PTY. A TUI client that connects to the daemon and shows all your sessions at once.

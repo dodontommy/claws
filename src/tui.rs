@@ -2560,11 +2560,13 @@ fn draw_sidebar_entry(
     let theme = crate::theme::current();
     let color = status_color_pulsed(&s.status, tick_phase);
     let glyph = status_glyph(&s.status, tick_phase);
-    let awaiting = s.status == "awaiting_permission";
-    // Brief flash on state transition: same subtle bg tint as awaiting,
-    // for ~500ms after the daemon reports the change.
+    let _awaiting = s.status == "awaiting_permission";
+    // The bg tint signals "something just happened" (state transition),
+    // not "this row needs you" — that's already conveyed by the pulsing
+    // glyph + colored label. Persistent tint competed with the selection
+    // gutter and made awaiting rows look like the selected one.
     let flashing = flash_ms.is_some();
-    let tint = awaiting || flashing;
+    let tint = flashing;
 
     // Awaiting-permission rows get a row-wide subtle bg tint so they're
     // visible from across the room. Painted before any other row content

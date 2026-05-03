@@ -4,6 +4,31 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.4] — 2026-05-02
+
+### Fixed
+- Sessions could get stuck on `spawning` status forever if Claude's
+  `SessionStart` hook didn't fire (custom builds, hook config not
+  picked up, slow first frame). PTY bytes flowing into the ring
+  buffer now also promote out of `spawning` as a fallback.
+- "Needs you" was falsely flagged on plain idle sessions. Claude's
+  `Notification` hook fires for many non-permission things (info
+  messages, completion notices) and we were treating all of them as
+  "awaiting permission". Only `PermissionRequest` is the real signal
+  now; sessions stuck mid-`Notification` no longer leak the awaiting
+  state forever.
+
+### Changed
+- The persistent row-wide bg tint on awaiting-permission rows is gone;
+  it competed with the selection gutter and made awaiting rows look
+  like the selected row at a glance. The 500ms transition flash, the
+  pulsing glyph (★/✦), and the "needs you" label still mark the state.
+
+### Added
+- Screenshot in the README (`docs/screenshot.png`) — populated dashboard
+  with mixed states, worktree branch info, and a flagged dangerous
+  session, on the catppuccin theme.
+
 ## [0.2.3] — 2026-05-02
 
 ### Reverted
