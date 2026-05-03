@@ -587,7 +587,7 @@ function renderDetail() {
           <button class="chip" data-keys="\\u0003">^C</button>
         </div>
         <form class="input-bar" id="form">
-          <input id="msg" placeholder="Type and send…" autocapitalize="sentences" />
+          <textarea id="msg" rows="1" placeholder="Type and send…" autocapitalize="sentences"></textarea>
           <button type="submit">Send</button>
         </form>
       </div>
@@ -603,11 +603,27 @@ function renderDetail() {
   root.querySelectorAll(".chip, .prompt-btn").forEach((c) => {
     c.addEventListener("click", () => sendKeys(decodeKeys(c.dataset.keys)));
   });
+  const msg = root.querySelector("#msg");
+  // Auto-grow the textarea up to ~5 lines so multi-line paste is visible.
+  const grow = () => {
+    msg.style.height = "auto";
+    const max = 5 * 20; // ~5 lines at line-height 20px
+    msg.style.height = Math.min(msg.scrollHeight, max) + "px";
+  };
+  msg.addEventListener("input", grow);
+  // Enter inserts a newline (mobile keyboards have no Shift); Send tap submits.
+  // Don't let stray Enter keys submit the form.
+  msg.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
+      // Default textarea behaviour — newline. Just stop the form from submitting.
+      e.stopPropagation();
+    }
+  });
   root.querySelector("#form").addEventListener("submit", (e) => {
     e.preventDefault();
-    const input = root.querySelector("#msg");
-    const v = input.value;
-    input.value = "";
+    const v = msg.value;
+    msg.value = "";
+    msg.style.height = "auto";
     sendKeys(v + "\r");
   });
 }
