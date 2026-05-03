@@ -665,29 +665,43 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                             .get("session_id")
                             .and_then(|x| x.as_str())
                             .and_then(|s| Uuid::parse_str(s).ok());
-                        // Default = no replay. The follow-up resize fires
-                        // SIGWINCH which triggers Claude to redraw the
-                        // alt-screen at the phone's actual geometry, and
-                        // that redraw is what xterm renders. Replaying the
-                        // ring buffer first looks cleaner-than-empty for
-                        // a moment, but the buffer's bytes assume the
-                        // daemon's previous geometry and produce visible
-                        // garbage during the brief interval before the
-                        // redraw lands. ~50ms of empty xterm reads better
-                        // than 50ms of overlap. `replay: true` is an
-                        // opt-in for tooling that wants raw history.
+                        // Default mode (`replay` absent or false): snapshot
+                        // the daemon's vt100 parser into a self-contained
+                        // ANSI sequence that recreates the *current* screen,
+                        // cursor, and modes in a fresh terminal — the same
+                        // way `tmux attach` works. Send that snapshot as
+                        // the first chunk, then stream live from the
+                        // cursor that was current when we took the snap.
+                        // This avoids the geometry-mismatch overlap that
+                        // raw ring-buffer replay produces, AND avoids the
+                        // black-flash of waiting for SIGWINCH to land.
+                        //
+                        // `replay: true` is an opt-in for tooling that
+                        // wants the raw byte history from `since`.
                         let replay = v.get("replay").and_then(|x| x.as_bool()).unwrap_or(false);
                         if let Some(sid) = sid {
-                            let cursor = if replay {
-                                v.get("since").and_then(|x| x.as_u64()).unwrap_or(0)
+                            if replay {
+                                let cursor = v.get("since").and_then(|x| x.as_u64()).unwrap_or(0);
+                                *subscribed.lock().await = Some((sid, cursor));
+                            } else if let Some(sess) = state.registry.get(sid) {
+                                let snap_bytes = sess.screen_replay();
+                                let cursor = sess.read_output(u64::MAX).1;
+                                *subscribed.lock().await = Some((sid, cursor));
+                                if !snap_bytes.is_empty() {
+                                    let b64 = base64::engine::general_purpose::STANDARD
+                                        .encode(&snap_bytes);
+                                    let msg = json!({
+                                        "kind": "session.output",
+                                        "session_id": sid,
+                                        "data_b64": b64,
+                                        "next_seq": cursor,
+                                    })
+                                    .to_string();
+                                    let _ = out_tx.send(msg).await;
+                                }
                             } else {
-                                state
-                                    .registry
-                                    .get(sid)
-                                    .map(|s| s.read_output(u64::MAX).1)
-                                    .unwrap_or(0)
-                            };
-                            *subscribed.lock().await = Some((sid, cursor));
+                                *subscribed.lock().await = Some((sid, 0));
+                            }
                         }
                     }
                     "unsubscribe" => {

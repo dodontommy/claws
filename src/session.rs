@@ -492,6 +492,19 @@ impl Session {
         Ok(())
     }
 
+    /// Snapshot the daemon's vt100 parser as a self-contained ANSI sequence
+    /// that recreates the *current* visible screen, cursor, input mode, and
+    /// title in a fresh terminal. This is how attaching clients (e.g. the
+    /// phone PWA) catch up: instead of replaying the raw ring buffer (whose
+    /// bytes assumed a different geometry and produce overlap when written
+    /// into a different-sized client), we serialize the daemon's internal
+    /// screen state into bytes the client renders cleanly. Same approach
+    /// tmux uses for `tmux attach`.
+    pub fn screen_replay(&self) -> Vec<u8> {
+        let s = self.state.lock().unwrap();
+        s.parser.screen().state_formatted()
+    }
+
     /// Scrape the daemon-side vt100 screen for Claude's context-fill status,
     /// which appears in its bottom status bar as e.g. `12% 120k/1.0M`. Not
     /// available in the JSONL or hooks — only on screen.
