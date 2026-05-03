@@ -97,7 +97,16 @@ enum PhoneAction {
     /// Print listener status, bind URL, and device count.
     Status,
     /// Mint a pair code, print it + a QR for the URL the phone should open.
-    Pair,
+    /// Pass `--url` once to tell claws what URL the phone should hit
+    /// (typically the tailnet HTTPS hostname); it's persisted so future
+    /// `claws phone pair` runs encode the right host into the QR.
+    Pair {
+        /// Public URL the phone should open, e.g.
+        /// `https://my-machine.tail-abc.ts.net`. Saved to phone.json on
+        /// success so subsequent pair runs reuse it.
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// List paired devices with id, label, paired-at, last-seen.
     Devices,
     /// Revoke a paired device by id (from `phone devices`).
@@ -203,18 +212,38 @@ async fn run_phone(action: PhoneAction) -> Result<()> {
             println!("devices:  {dev}");
             Ok(())
         }
-        PhoneAction::Pair => {
-            let res = client::call("phone_pair_code", json!({})).await?;
+        PhoneAction::Pair { url } => {
+            let mut params = json!({});
+            if let Some(u) = url.as_ref() {
+                params["set_url"] = json!(u);
+            }
+            let res = client::call("phone_pair_code", params).await?;
             let code = res.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let bind = res.get("bind").and_then(|v| v.as_str()).unwrap_or("");
-            let url = format!("http://{bind}/#code={code}");
+            // public_url honors: --url override → saved phone.json → tailscale auto-detect → bind fallback
+            let public_url = res
+                .get("public_url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(bind);
+            let phone_url = if public_url.starts_with("http") {
+                format!("{public_url}/#code={code}")
+            } else {
+                format!("http://{public_url}/#code={code}")
+            };
             println!("Pair code: {code}");
-            println!("URL:       {url}");
+            println!("URL:       {phone_url}");
             println!("\nTTL: 10 minutes. Single use.\n");
-            print_qr(&url);
-            println!("\nIf you used `tailscale serve --https`, your phone should open");
-            println!("https://<your-machine>.<tailnet>.ts.net/#code={code}");
-            println!("instead of the http://localhost URL above.");
+            print_qr(&phone_url);
+            if !public_url.starts_with("http") || public_url.starts_with("http://127.")
+                || public_url.starts_with("http://localhost")
+            {
+                println!();
+                println!("⚠  This URL points at loopback ({public_url}). Your phone won't reach it.");
+                println!("   Front the listener with `tailscale serve --bg --https=443 http://{bind}`,");
+                println!("   then re-run `claws phone pair --url https://<machine>.<tailnet>.ts.net`");
+                println!("   so the QR encodes the right host. We'll auto-detect Tailscale next time.");
+            }
             Ok(())
         }
         PhoneAction::Devices => {

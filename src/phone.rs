@@ -69,6 +69,12 @@ pub struct PhoneState {
     /// This is what the browser wants as `applicationServerKey`.
     #[serde(default)]
     pub vapid_pubkey_b64: Option<String>,
+    /// User-facing URL the phone should open — `https://<machine>.<tailnet>.ts.net`
+    /// or whatever fronting service is in front of the local listener. Set
+    /// once via `claws phone pair --url …` and reused for all future QR
+    /// codes. Also auto-detected from `tailscale serve status` when missing.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +178,29 @@ impl PhoneHandle {
         // Garbage-collect expired entries opportunistically.
         g.retain(|_, t| t.elapsed() < PAIR_CODE_TTL);
         code
+    }
+
+    pub async fn set_public_url(&self, url: String) {
+        let mut g = self.state.state.write().await;
+        g.public_url = Some(url);
+        let _ = save_state(&g);
+    }
+
+    /// Resolve the URL the phone should open. Priority:
+    ///   1. The explicit value the user saved with `--url` (in phone.json).
+    ///   2. Auto-detection via `tailscale serve status --json`. We look for
+    ///      a target matching `http://127.0.0.1:<our-port>` or `localhost:<our-port>`
+    ///      and use the corresponding tailnet hostname.
+    ///   3. Fallback: `http://<bind>` — only useful for browsers running on
+    ///      the same machine as the daemon.
+    pub async fn resolve_public_url(&self) -> String {
+        if let Some(u) = self.state.state.read().await.public_url.clone() {
+            return u;
+        }
+        if let Some(u) = detect_tailscale_serve_url(self.bind.port()) {
+            return u;
+        }
+        format!("http://{}", self.bind)
     }
 
     pub async fn devices(&self) -> Vec<Device> {
@@ -806,6 +835,39 @@ fn uuid_seq(id: Uuid) -> u64 {
 
 fn ms_since_epoch_st(t: SystemTime) -> u128 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+/// Shell out to `tailscale serve status --json` and look for a serve entry
+/// pointing at our local bind. Returns the user-visible HTTPS URL when found.
+/// Best-effort: we silently return None if tailscale isn't on PATH, the JSON
+/// shape has changed, or no serve route matches our port.
+fn detect_tailscale_serve_url(local_port: u16) -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["serve", "status", "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    // Shape (as of recent tailscale): { "Web": { "<host>:<port>": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:9817" } } } }, ... }
+    let web = v.get("Web")?.as_object()?;
+    let needle_a = format!("http://127.0.0.1:{local_port}");
+    let needle_b = format!("http://localhost:{local_port}");
+    for (host_port, entry) in web {
+        let handlers = entry.get("Handlers").and_then(|h| h.as_object())?;
+        for handler in handlers.values() {
+            if let Some(proxy) = handler.get("Proxy").and_then(|p| p.as_str()) {
+                if proxy == needle_a || proxy == needle_b {
+                    // host_port is "machine.tailnet.ts.net:443" or similar.
+                    // Strip :443 since that's HTTPS default; keep other ports.
+                    let host = host_port.trim_end_matches(":443");
+                    return Some(format!("https://{host}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---- Web Push --------------------------------------------------------------

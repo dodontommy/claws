@@ -339,7 +339,7 @@ async fn dispatch(
         "phone_status" => handle_phone_status(req.id, phone_handle).await,
         "phone_start" => handle_phone_start(req.id, &req.params, phone_handle, registry, store).await,
         "phone_stop" => handle_phone_stop(req.id, phone_handle).await,
-        "phone_pair_code" => handle_phone_pair_code(req.id, phone_handle).await,
+        "phone_pair_code" => handle_phone_pair_code(req.id, &req.params, phone_handle).await,
         "phone_devices" => handle_phone_devices(req.id, phone_handle).await,
         "phone_revoke" => handle_phone_revoke(req.id, &req.params, phone_handle).await,
         other => err(req.id, RpcError::method_not_found(other)),
@@ -411,8 +411,17 @@ async fn handle_phone_stop(
 
 async fn handle_phone_pair_code(
     id: u64,
+    params: &serde_json::Value,
     handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
 ) -> Response {
+    // Optional `set_url` param: persist a public URL the phone can reach.
+    // Set once, reused for every future pair until the user sets another.
+    let set_url = params
+        .get("set_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let g = handle.lock().await;
     let h = match g.as_ref() {
         Some(h) => h,
@@ -425,8 +434,20 @@ async fn handle_phone_pair_code(
             )
         }
     };
+    if let Some(u) = set_url.as_ref() {
+        h.set_public_url(u.clone()).await;
+    }
     let code = h.mint_pair_code().await;
-    ok(id, json!({"code": code, "bind": h.bind.to_string(), "ttl_secs": 600}))
+    let public_url = h.resolve_public_url().await;
+    ok(
+        id,
+        json!({
+            "code": code,
+            "bind": h.bind.to_string(),
+            "ttl_secs": 600,
+            "public_url": public_url,
+        }),
+    )
 }
 
 async fn handle_phone_devices(
