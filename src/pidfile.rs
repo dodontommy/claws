@@ -8,6 +8,7 @@
 use crate::paths;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Command;
 
 const PID_FILENAME: &str = "daemon.pid";

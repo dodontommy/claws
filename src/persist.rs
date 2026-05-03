@@ -16,7 +16,6 @@ pub struct PersistedSession {
     pub cwd: PathBuf,
     pub name: String,
     pub model: Option<String>,
-    pub started_at_ms: u128,
     pub extra_args: Vec<String>,
     pub display_override: Option<String>,
 }
@@ -113,12 +112,15 @@ impl Store {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
             let display_override: Option<String> = row.get(6).ok();
+            // started_at_ms (col 4) is selected for the ORDER BY to be cheap;
+            // we don't surface it on PersistedSession because nothing downstream
+            // uses it — Session::started_at is reset on resume.
+            let _: i64 = row.get(4)?;
             Ok(PersistedSession {
                 id,
                 cwd: PathBuf::from(row.get::<_, String>(1)?),
                 name: row.get(2)?,
                 model: row.get(3)?,
-                started_at_ms: row.get::<_, i64>(4)? as u128,
                 extra_args,
                 display_override,
             })

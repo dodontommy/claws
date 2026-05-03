@@ -29,20 +29,6 @@ pub struct Response {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Notification {
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ServerMessage {
-    Response(Response),
-    Notification(Notification),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct RpcError {
     pub code: i32,
     pub message: String,

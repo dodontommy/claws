@@ -49,9 +49,6 @@ impl RingBuffer {
         (bytes, self.total_written)
     }
 
-    pub fn total_written(&self) -> u64 {
-        self.total_written
-    }
 }
 
 #[cfg(test)]
