@@ -204,9 +204,47 @@
   .pair button { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; padding: 12px 20px; font-weight: 600; width: 100%; max-width: 320px; }
   .pair .err { color: var(--bad); font-size: 13px; }
   .empty { color: var(--muted); text-align: center; padding: 40px 20px; }
+
+  /* Ace-style iOS input proxy. 1×1 fixed in the viewport so its geometry
+     never changes; opacity 0 + pointer-events none so it's invisible and
+     untouchable. Focus is summoned synchronously from a touchend handler
+     on the terminal host, not from tapping this element. */
+  #ios-input {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    resize: none;
+    pointer-events: none;
+    z-index: 1;
+    /* font-size: 16px is required to keep iOS from auto-zooming on focus. */
+    font-size: 16px;
+  }
 </style>
 </head>
 <body>
+<!-- iOS keyboard input proxy, Ace editor pattern (src/keyboard/textinput.js).
+     Positioned fixed at viewport top, 1x1 transparent, never reparented.
+     iOS Safari dismisses the keyboard if the focused element's geometry
+     changes, gets reparented, OR its value gets set to "". We satisfy
+     all three rules: position is fixed independent of ancestor reflow,
+     this element lives at body root and never moves, and the value
+     cycles only between PLACEHOLDER and PLACEHOLDER+keystrokes (see
+     app.js). Decoupled from #app so xterm's render loop can't disturb it. -->
+<textarea
+  id="ios-input"
+  autocomplete="off"
+  autocorrect="off"
+  autocapitalize="off"
+  spellcheck="false"
+  wrap="off"
+  aria-hidden="true"
+  tabindex="-1"></textarea>
 <!-- Self-nuke. Visit `?reset=1` to unregister the service worker and
      drop all caches before any other script loads. Lives inline because
      a stale cached app.js would otherwise prevent its own replacement. -->

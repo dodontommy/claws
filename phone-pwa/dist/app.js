@@ -281,6 +281,9 @@ function attachTerminalTo(mount) {
   if (!termOpened) {
     t.open(termHost);
     termOpened = true;
+    // Take xterm's helper textarea out of the focus path — our Ace-style
+    // iOS input proxy is the only element that should receive keyboard.
+    disableXtermHelperTextarea();
     // No window/visualViewport resize listener at all. iOS Safari fires
     // `resize` (not just visualViewport.resize) when the keyboard shows,
     // so any auto-fit ends up triggering an xterm relayout that steals
@@ -313,6 +316,144 @@ function resetTerminalForSession(id) {
     termSession = id;
     resetUtf8Decoder();
   }
+}
+
+// ---- iOS keyboard input proxy (Ace pattern) --------------------------------
+//
+// Why this is shaped the way it is: iOS Safari dismisses the soft keyboard
+// when the focused element's geometry changes, when it gets reparented, or
+// when its `value` is set to "". The xterm helper textarea + every variant
+// we tried all violated at least one of those rules. The Ace editor's
+// textinput.js solves it (proven on Cloud9, Replit mobile, etc.) by:
+//
+//   1. Using a real <textarea> at fixed 1×1 with opacity 0 — so geometry is
+//      invariant under any reflow.
+//   2. Never reparenting it — it lives at body root and stays put.
+//   3. Never clearing it — instead the value cycles between PLACEHOLDER
+//      and PLACEHOLDER+keystrokes, with the cursor anchored mid-string.
+//      iOS treats that as "still being edited" and keeps the keyboard up.
+//
+// The PLACEHOLDER sentinel:
+//   "\n ab" + cursor + "cde fg\n"
+// gives autocorrect "anchor" characters so it doesn't suggest replacements
+// for the entire content, and lets us detect arrow keys via selectionchange
+// (the only event iOS fires for arrow keys with a hardware keyboard).
+
+const IOS_PLACEHOLDER_PRE = "\n ab";
+const IOS_PLACEHOLDER_POST = "cde fg\n";
+const IOS_PLACEHOLDER = IOS_PLACEHOLDER_PRE + IOS_PLACEHOLDER_POST;
+const IOS_CURSOR_HOME = IOS_PLACEHOLDER_PRE.length;
+const IOS_CURSOR_TAIL = IOS_CURSOR_HOME;
+
+const iosInput = document.getElementById("ios-input");
+let iosComposing = false;
+
+function iosResetSelection() {
+  if (!iosInput) return;
+  iosInput.value = IOS_PLACEHOLDER;
+  try { iosInput.setSelectionRange(IOS_CURSOR_HOME, IOS_CURSOR_TAIL); } catch (e) {}
+}
+
+// MUST be called synchronously inside touchend / click / mousedown.
+// Async — including setTimeout(fn, 0) — breaks iOS's user-gesture rule.
+function focusIosInput() {
+  if (!iosInput) return;
+  iosResetSelection();
+  iosInput.focus({ preventScroll: true });
+}
+
+if (iosInput) {
+  iosResetSelection();
+
+  iosInput.addEventListener("input", () => {
+    if (iosComposing) return;
+    const value = iosInput.value;
+    if (value === IOS_PLACEHOLDER) return;
+
+    // Common-prefix length against PLACEHOLDER_PRE.
+    let prefixLen = 0;
+    const minPre = Math.min(IOS_CURSOR_HOME, value.length);
+    while (prefixLen < minPre && value[prefixLen] === IOS_PLACEHOLDER[prefixLen]) {
+      prefixLen++;
+    }
+    // Common-suffix length against PLACEHOLDER_POST.
+    let suffixLen = 0;
+    const placeholderTail = IOS_PLACEHOLDER.length - IOS_CURSOR_TAIL;
+    while (
+      suffixLen < placeholderTail &&
+      suffixLen < value.length - prefixLen &&
+      value[value.length - 1 - suffixLen] === IOS_PLACEHOLDER[IOS_PLACEHOLDER.length - 1 - suffixLen]
+    ) {
+      suffixLen++;
+    }
+
+    const inserted = value.slice(prefixLen, value.length - suffixLen);
+    const deletedLeft = IOS_CURSOR_HOME - prefixLen;
+    const deletedRight = placeholderTail - suffixLen;
+
+    // Translate into terminal bytes. Backspace = DEL (0x7f) per Claude's
+    // line-edit conventions. Forward-delete = CSI 3 ~.
+    for (let i = 0; i < deletedLeft; i++) sendKeys("\x7f");
+    if (inserted) {
+      // textarea returns soft-Enter as \n; the terminal wants \r.
+      sendKeys(inserted.replace(/\n/g, "\r"));
+    }
+    for (let i = 0; i < deletedRight; i++) sendKeys("\x1b[3~");
+
+    // Re-anchor the placeholder so the next keystroke diff still works.
+    iosResetSelection();
+  });
+
+  // Special keys: Enter/Tab/Backspace at the boundary, plus hardware-only
+  // keys that don't fire `input` (function keys, etc.).
+  iosInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      sendKeys("\r");
+      e.preventDefault();
+      iosResetSelection();
+    } else if (e.key === "Tab") {
+      sendKeys("\t");
+      e.preventDefault();
+    } else if (e.key === "Backspace" && iosInput.selectionStart === IOS_CURSOR_HOME) {
+      // Backspace at the boundary — input event won't see anything.
+      sendKeys("\x7f");
+      e.preventDefault();
+    }
+  });
+
+  // IME composition support — even English autocorrect uses this. While
+  // composing, we suppress per-keystroke forwarding; the final string
+  // arrives in the input event after compositionend.
+  iosInput.addEventListener("compositionstart", () => { iosComposing = true; });
+  iosInput.addEventListener("compositionend", () => {
+    iosComposing = false;
+    iosInput.dispatchEvent(new Event("input"));
+  });
+
+  // iOS arrow keys (hardware keyboards) only fire `selectionchange` on
+  // document, not on the textarea. Map cursor positions to arrow escapes.
+  document.addEventListener("selectionchange", () => {
+    if (document.activeElement !== iosInput) return;
+    if (iosComposing) return;
+    const s = iosInput.selectionStart;
+    const e = iosInput.selectionEnd;
+    if (s !== e) return;
+    if (s === IOS_CURSOR_HOME) return;
+    let seq = null;
+    if (s === 0) seq = "\x1b[A";                                  // up
+    else if (s === IOS_CURSOR_HOME - 1) seq = "\x1b[D";           // left
+    else if (s === IOS_CURSOR_TAIL) seq = "\x1b[C";               // right
+    else if (s === IOS_PLACEHOLDER.length - 1) seq = "\x1b[B";    // down
+    if (seq) sendKeys(seq);
+    iosResetSelection();
+  });
+}
+
+// Disable xterm's built-in helper textarea so it doesn't compete for focus.
+function disableXtermHelperTextarea() {
+  if (!term) return;
+  const ta = term.textarea || (term.element && term.element.querySelector("textarea"));
+  if (ta) ta.tabIndex = -1;
 }
 
 // ---- Notifications ----------------------------------------------------------
@@ -604,19 +745,13 @@ function renderDetail() {
         ${promptBlock}
         <div class="pty-mount" id="pty-mount"></div>
         <div class="chips">
+          <button class="chip" data-action="focus">⌨︎ Type</button>
           <button class="chip" data-keys="\\u001b">Esc</button>
           <button class="chip" data-keys="\\u001b[A">↑</button>
           <button class="chip" data-keys="\\u001b[B">↓</button>
           <button class="chip" data-keys="\\u0003">^C</button>
           <button class="chip" data-keys="\\u0004">^D</button>
         </div>
-        <!-- Plain input bar. Trying to redirect into xterm on iOS Safari
-             tripped every iOS keyboard quirk known to humanity; a real
-             textarea that the user actually edits behaves correctly. -->
-        <form class="input-bar" id="form">
-          <textarea id="msg" rows="1" placeholder="Type and send…" autocapitalize="sentences"></textarea>
-          <button type="submit">Send</button>
-        </form>
       </div>
     </div>
   `);
@@ -629,53 +764,20 @@ function renderDetail() {
   });
   root.querySelectorAll(".chip, .prompt-btn").forEach((c) => {
     c.addEventListener("click", () => {
-      // Keyboard chip focuses the password proxy synchronously in the
+      // Keyboard chip focuses the iOS input proxy synchronously in the
       // click handler so iOS pops the keyboard.
       if (c.dataset.action === "focus") {
-        const ta = document.getElementById("ptype");
-        if (ta) ta.focus({ preventScroll: true });
+        focusIosInput();
         return;
       }
       sendKeys(decodeKeys(c.dataset.keys));
     });
   });
-  // Plain input bar wiring. Tap Send (or hit Enter on a hardware keyboard)
-  // to submit. The textarea forwards its full value plus \r as one
-  // bracketed-paste-wrapped block on the daemon side, so multi-line
-  // paste survives intact instead of submitting on the first \n.
-  const msg = root.querySelector("#msg");
-  const grow = () => {
-    msg.style.height = "auto";
-    msg.style.height = Math.min(msg.scrollHeight, 5 * 22) + "px";
-  };
-  msg.addEventListener("input", grow);
-  // On mobile keyboards Enter inserts a newline; we keep that behaviour
-  // (Enter ≠ Send on phone) and the user taps the Send button to commit.
-  // On desktop hardware Cmd/Ctrl-Enter sends.
-  msg.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      submitMsg();
-    }
-  });
-  const form = root.querySelector("#form");
-  form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    submitMsg();
-  });
-  function submitMsg() {
-    const v = msg.value;
-    if (!v) return;
-    msg.value = "";
-    msg.style.height = "auto";
-    sendKeys(v + "\r");
-  }
-  // Tapping the terminal area focuses the proxy synchronously inside the
-  // touch handler so iOS pops the keyboard.
+  // Tapping the terminal area also summons the keyboard, mirroring native
+  // iOS terminal apps. Fires inside the touch handler.
   const ptyMount = document.getElementById("pty-mount");
-  const focusInput = () => ptype.focus({ preventScroll: true });
-  ptyMount.addEventListener("touchstart", focusInput, { passive: true });
-  ptyMount.addEventListener("mousedown", focusInput);
+  ptyMount.addEventListener("touchend", focusIosInput, { passive: false });
+  ptyMount.addEventListener("mousedown", focusIosInput);
 }
 
 function decodeKeys(s) {
