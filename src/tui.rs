@@ -330,12 +330,20 @@ async fn tick_work(app: &mut App) {
 async fn refresh_sessions(app: &mut App) {
     match client::list_sessions_raw().await {
         Ok(mut list) => {
-            // Sort: needs-you first, then streaming, then idle by recent activity,
-            // spawning, exited last. Within a status bucket, most-recent first.
+            // Sort: needs-you first, then streaming, then idle, spawning, exited last.
+            // Within active buckets sort by id (spawn order) so concurrently-streaming
+            // rows don't swap places every tick. Within quiet buckets, sort by recent
+            // activity so the most recently touched idle session bubbles up.
             list.sort_by(|a, b| {
-                sort_priority(&a.status)
-                    .cmp(&sort_priority(&b.status))
-                    .then_with(|| b.last_activity_ms.cmp(&a.last_activity_ms))
+                let pa = sort_priority(&a.status);
+                let pb = sort_priority(&b.status);
+                pa.cmp(&pb).then_with(|| {
+                    if is_active_bucket(&a.status) {
+                        a.id.cmp(&b.id)
+                    } else {
+                        b.last_activity_ms.cmp(&a.last_activity_ms)
+                    }
+                })
             });
             // Track per-session status transitions so the sidebar can flash
             // a row briefly when the daemon reports a state change.
@@ -373,6 +381,10 @@ async fn refresh_sessions(app: &mut App) {
         }
         Err(e) => app.set_status(format!("daemon error: {e}")),
     }
+}
+
+fn is_active_bucket(status: &str) -> bool {
+    matches!(status, "awaiting_permission" | "streaming" | "spawning")
 }
 
 fn sort_priority(status: &str) -> u8 {

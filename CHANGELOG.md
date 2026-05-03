@@ -4,6 +4,17 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.8] — 2026-05-03
+
+### Fixed
+- Sidebar rows for two concurrently-working sessions used to swap places
+  every tick because the sort tiebreaker was `last_activity_ms`, which
+  both rows update constantly while streaming. Active buckets
+  (awaiting-permission, streaming, spawning) now sort by spawn order
+  (session id), so live sessions hold a stable position. Quiet buckets
+  (idle, exited, resume-failed) keep the recency tiebreaker since
+  "what did I touch last" is the useful signal there.
+
 ## [0.2.7] — 2026-05-02
 
 ### Added
