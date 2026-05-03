@@ -4,6 +4,15 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.5] — 2026-05-02
+
+### Changed
+- Dropped mouse capture entirely. Capturing mouse events disabled the
+  terminal's native drag-to-select / copy-paste, which is the more
+  valuable interaction. We lose double-click-attach and scroll-wheel
+  navigation in the sidebar — both already had keyboard equivalents
+  (`Enter` and `j`/`k`).
+
 ## [0.2.4] — 2026-05-02
 
 ### Fixed

@@ -2,8 +2,7 @@ use crate::client;
 use crate::protocol::SessionInfo;
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -32,14 +31,17 @@ const DANGEROUS_FLAG: &str = "--dangerously-skip-permissions";
 pub async fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Deliberately no EnableMouseCapture: capturing mouse events disables
+    // the terminal's native drag-to-select / copy-paste, which is the more
+    // valuable interaction. Keyboard nav handles everything mouse used to.
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_inner(&mut terminal).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -136,7 +138,6 @@ struct App {
     grid_mode: bool,
     filter: Option<String>,
     filter_cursor: usize,
-    last_click: Option<(usize, SystemTime)>,
     /// Vertical scroll offset for the detail pane's last-message paragraph.
     /// Reset to 0 whenever the selected session changes.
     detail_scroll: u16,
@@ -172,7 +173,6 @@ impl App {
             grid_mode: false,
             filter: None,
             filter_cursor: 0,
-            last_click: None,
             detail_scroll: 0,
             last_status: std::collections::HashMap::new(),
             session_branches: std::collections::HashMap::new(),
@@ -279,9 +279,6 @@ async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<
                 match ev {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(key, &mut app).await
-                    }
-                    Some(Ok(Event::Mouse(ev))) => {
-                        handle_mouse(ev, &mut app).await
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
                     if let View::Attached { session_id, parser, .. } = &mut app.view {
@@ -398,51 +395,6 @@ async fn handle_key(key: KeyEvent, app: &mut App) {
     match &mut app.view {
         View::Dashboard => handle_dashboard_key(key, app).await,
         View::Attached { .. } => handle_attached_key(key, app).await,
-    }
-}
-
-async fn handle_mouse(ev: MouseEvent, app: &mut App) {
-    // Only act on dashboard for now; attached view forwards mouse to PTY in v.next.
-    if !matches!(app.view, View::Dashboard) || app.modal.is_some() {
-        return;
-    }
-    match ev.kind {
-        MouseEventKind::ScrollUp => app.move_up(),
-        MouseEventKind::ScrollDown => app.move_down(),
-        MouseEventKind::Down(MouseButton::Left) => {
-            // Body area starts at row 2 (after title + separator).
-            // Sidebar layout: each session entry is SIDEBAR_ROW_H rows.
-            // Clicks in the sidebar select; clicks in the detail pane do nothing.
-            let body_y0 = 2u16;
-            if ev.row < body_y0 {
-                return;
-            }
-            if ev.column >= SIDEBAR_W {
-                return;
-            }
-            let row = (ev.row - body_y0) / SIDEBAR_ROW_H;
-            let idx = row as usize;
-            if idx >= app.visible_count() {
-                return;
-            }
-            let now = SystemTime::now();
-            let dbl = match app.last_click {
-                Some((prev_idx, t))
-                    if prev_idx == idx
-                        && now.duration_since(t).unwrap_or_default()
-                            < Duration::from_millis(500) =>
-                {
-                    true
-                }
-                _ => false,
-            };
-            app.select(idx);
-            app.last_click = Some((idx, now));
-            if dbl {
-                attach_at_index(app, idx).await;
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1508,7 +1460,6 @@ fn draw_help(f: &mut ratatui::Frame, scroll: u16) {
     lines.push(sec("dashboard"));
     lines.push(row("h j k l / arrows", "navigate sessions"));
     lines.push(row("enter", "attach to selected session"));
-    lines.push(row("dbl-click", "attach to clicked session"));
     lines.push(row("c", "new session (opens spawn form)"));
     lines.push(row("g", "toggle grid / sidebar layout"));
     lines.push(row("r", "rename selected"));
