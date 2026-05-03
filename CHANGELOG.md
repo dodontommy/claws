@@ -4,6 +4,23 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.11] — 2026-05-03
+
+### Fixed
+- Multi-line paste while attached to a session no longer submits the
+  first line and drops the rest. Without bracketed-paste mode, crossterm
+  was decomposing pasted text into a stream of individual key events; the
+  first newline became a Press(Enter) that Claude saw and submitted on.
+  We now enable bracketed paste at TUI init, listen for Event::Paste, and
+  forward the payload wrapped in `\x1b[200~ ... \x1b[201~` so Claude's
+  own bracketed-paste handling treats the whole thing as one block.
+
+### Internal
+- Cleared the five stale `cargo build` warnings: gated the Windows-only
+  `Command` import in pidfile.rs, dropped never-read fields/methods from
+  persist.rs / ring.rs, removed unused protocol scaffolding. Zero
+  warnings on a fresh build.
+
 ## [0.2.10] — 2026-05-03
 
 ### Added
