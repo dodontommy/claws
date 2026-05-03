@@ -20,23 +20,38 @@ pub async fn run() -> Result<()> {
     let sock = paths::socket_name()?;
     tracing::info!(socket = %sock, "daemon starting");
 
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(&sock);
-
-    // Bind the socket FIRST so a "second daemon trying to start" loses on
-    // bind and exits without ever touching the token file. Writing the token
-    // before binding (the previous order) was a race: two near-simultaneous
-    // starts had the second daemon overwrite the first's token on disk
-    // before failing to bind, leaving every subsequent client request
-    // rejected by the running daemon as -32001 unauthorized.
-    let name = sock
-        .clone()
-        .to_fs_name::<GenericFilePath>()
-        .context("invalid socket name")?;
-    let listener = ListenerOptions::new()
-        .name(name)
-        .create_tokio()
-        .context("failed to bind socket (already in use?)")?;
+    // Bind the listener with a "don't clobber a live daemon" protocol:
+    //
+    //   1. Try to bind directly.
+    //   2. If bind fails because the path is in use, probe by connecting. If
+    //      a daemon answers on the socket, log and exit cleanly — never
+    //      remove the file or write a new auth token, so the live daemon
+    //      stays untouched.
+    //   3. If the connect fails (ECONNREFUSED/ENOENT), the file is stale
+    //      from a crashed daemon; remove it and retry the bind once.
+    //
+    // The previous code unconditionally `remove_file`d before binding, which
+    // let two daemons race-bind to the same path: D2's remove_file deleted
+    // D1's socket entry, D2's bind created a fresh inode at the same path,
+    // and now both processes were "the daemon" — duplicating `claude --resume`
+    // children for every persisted session and bricking active sessions.
+    let listener = match try_bind(&sock).await {
+        Ok(l) => l,
+        Err(_first_err) => {
+            if probe_existing_daemon(&sock).await {
+                tracing::info!(
+                    socket = %sock,
+                    "another daemon is already listening; exiting cleanly so we don't \
+                     clobber its socket and spawn duplicate claude --resume children"
+                );
+                return Ok(());
+            }
+            tracing::warn!(socket = %sock, "stale socket file from a crashed daemon — removing");
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&sock);
+            try_bind(&sock).await.context("retry bind after removing stale socket")?
+        }
+    };
 
     let auth_token = Arc::new(crate::auth::write_new_token().context("write auth token")?);
     tracing::info!("auth token written");
@@ -86,6 +101,35 @@ pub async fn run() -> Result<()> {
     crate::pidfile::remove();
 
     Ok(())
+}
+
+async fn try_bind(
+    sock: &str,
+) -> Result<interprocess::local_socket::tokio::Listener> {
+    let name = sock
+        .to_string()
+        .to_fs_name::<GenericFilePath>()
+        .context("invalid socket name")?;
+    ListenerOptions::new()
+        .name(name)
+        .create_tokio()
+        .context("bind socket")
+}
+
+/// Connect to the socket. If the connect succeeds within a short timeout,
+/// some process is accepting on it — treat as "live daemon" and back off.
+/// If connect fails (no listener / file gone), it's our turn to bind.
+async fn probe_existing_daemon(sock: &str) -> bool {
+    let name = match sock.to_string().to_fs_name::<GenericFilePath>() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let connect = interprocess::local_socket::tokio::Stream::connect(name);
+    match tokio::time::timeout(std::time::Duration::from_millis(500), connect).await {
+        Ok(Ok(_stream)) => true,
+        // ConnectionRefused / NotFound / timeout → no live daemon.
+        _ => false,
+    }
 }
 
 async fn auto_resume(store: &Store, reg: &SessionRegistry) {

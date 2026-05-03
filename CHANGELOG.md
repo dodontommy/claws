@@ -4,6 +4,23 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.9] — 2026-05-03
+
+### Fixed
+- Two daemons could end up running on the same socket. The startup path
+  used to `remove_file(&sock)` unconditionally before binding, so a second
+  daemon spawned later would clobber the first's filesystem entry, bind a
+  fresh inode at the same path, and run `auto_resume` — which then spawned
+  duplicate `claude --resume <id>` children for every persisted session,
+  bricking active conversations as the two claudes fought over the same
+  JSONL transcript. New protocol on startup: try the bind first; on
+  failure, probe the socket with a short-timeout connect; if a daemon is
+  listening, log and exit cleanly without touching anything; only remove
+  the socket file (and retry the bind) when the connect fails, which
+  identifies a stale path from a crashed daemon. The v0.2.6 fix covered
+  the simultaneous-start race; this covers the late-start race that was
+  causing recurring duplicate-daemon reports.
+
 ## [0.2.8] — 2026-05-03
 
 ### Fixed
