@@ -1,7 +1,7 @@
-// claws phone PWA — Phase 1 single-file UI.
-// Phase 2 swaps this for a Vite/Preact build with xterm.js.
+// claws phone PWA — vanilla single-file UI with Web Push + permission UI.
 
 const TOKEN_KEY = "claws.deviceToken";
+const PUSH_FLAG_KEY = "claws.pushSubscribed";
 const $app = document.getElementById("app");
 
 const state = {
@@ -14,6 +14,9 @@ const state = {
   ws: null,
   wsAlive: false,
   pairError: null,
+  // Per-session permission-request payloads. Cleared when status leaves
+  // awaiting_permission. Keyed by session_id.
+  permissionRequests: {},
 };
 
 // ---- Pairing ----------------------------------------------------------------
@@ -95,6 +98,13 @@ function handleServerEvent(msg) {
   switch (msg.kind) {
     case "snapshot":
       state.sessions = msg.sessions || [];
+      // Drop permission-request entries for sessions that have moved on.
+      for (const sid of Object.keys(state.permissionRequests)) {
+        const s = state.sessions.find((x) => x.id === sid);
+        if (!s || s.status !== "awaiting_permission") {
+          delete state.permissionRequests[sid];
+        }
+      }
       sortSessions();
       render();
       break;
@@ -103,12 +113,14 @@ function handleServerEvent(msg) {
       const idx = state.sessions.findIndex((x) => x.id === s.id);
       if (idx >= 0) state.sessions[idx] = s;
       else state.sessions.push(s);
+      if (s.status !== "awaiting_permission") delete state.permissionRequests[s.id];
       sortSessions();
       render();
       break;
     }
     case "session.removed":
       state.sessions = state.sessions.filter((s) => s.id !== msg.session_id);
+      delete state.permissionRequests[msg.session_id];
       if (state.selectedId === msg.session_id) {
         state.selectedId = null;
         state.view = "list";
@@ -123,10 +135,22 @@ function handleServerEvent(msg) {
       }
       break;
     case "session.permission_request":
-      // Phase 3 will surface a structured Allow/Deny modal here.
-      // For now, the awaiting_permission status badge in the list view + a
-      // browser notification (when permission is granted) is enough.
-      maybeNotify(msg);
+      state.permissionRequests[msg.session_id] = {
+        name: msg.name,
+        tool_name: msg.tool_name || null,
+        at: Date.now(),
+      };
+      maybeNotify({
+        session_id: msg.session_id,
+        title: `${msg.name || "session"} — needs you`,
+        body: msg.tool_name ? `wants to run ${msg.tool_name}` : "needs your input",
+      });
+      render();
+      break;
+    case "session.exited":
+      // Snapshot will reflect the new status; we just clear any open prompt.
+      delete state.permissionRequests[msg.session_id];
+      render();
       break;
   }
 }
@@ -170,11 +194,16 @@ function stripAnsi(s) {
 // ---- Notifications ----------------------------------------------------------
 
 function maybeNotify(msg) {
+  // Foreground notifications only — Web Push (handled by the service worker)
+  // covers the background case. Tag by session so a burst on one session
+  // collapses into a single notification.
   if (!("Notification" in window)) return;
   if (Notification.permission !== "granted") return;
-  const s = state.sessions.find((x) => x.id === msg.session_id);
-  const body = msg.tool_name ? `wants to run ${msg.tool_name}` : "needs your input";
-  new Notification(`${s?.name || "claws"} — needs you`, { body, tag: msg.session_id });
+  const title = msg.title || "claws";
+  const body = msg.body || "";
+  try {
+    new Notification(title, { body, tag: msg.session_id ? `claws:${msg.session_id}` : "claws" });
+  } catch {}
 }
 
 async function ensureNotificationPermission() {
@@ -182,6 +211,65 @@ async function ensureNotificationPermission() {
   if (Notification.permission === "default") {
     try { await Notification.requestPermission(); } catch {}
   }
+}
+
+/// Subscribe this device for Web Push if it isn't already. Idempotent on
+/// repeated runs because the browser dedupes by application server key.
+async function ensurePushSubscription() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  if (Notification.permission !== "granted") return;
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    let key;
+    try {
+      const r = await fetch("/api/push/vapid_key", { headers: authHeaders() });
+      if (!r.ok) return;
+      const { application_server_key } = await r.json();
+      key = urlB64ToUint8Array(application_server_key);
+    } catch (e) {
+      console.warn("vapid fetch failed", e);
+      return;
+    }
+    try {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: key,
+      });
+    } catch (e) {
+      console.warn("push subscribe failed", e);
+      return;
+    }
+  }
+  // Send the subscription to the daemon (it dedupes by endpoint).
+  const json = sub.toJSON();
+  try {
+    await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({
+        endpoint: json.endpoint,
+        p256dh: json.keys && json.keys.p256dh,
+        auth: json.keys && json.keys.auth,
+      }),
+    });
+    localStorage.setItem(PUSH_FLAG_KEY, "1");
+  } catch (e) {
+    console.warn("subscribe POST failed", e);
+  }
+}
+
+function authHeaders() {
+  return state.token ? { Authorization: `Bearer ${state.token}` } : {};
+}
+
+function urlB64ToUint8Array(b64) {
+  const padding = "=".repeat((4 - (b64.length % 4)) % 4);
+  const base64 = (b64 + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
 }
 
 // ---- Views ------------------------------------------------------------------
@@ -272,6 +360,17 @@ function renderDetail() {
   const s = state.sessions.find((x) => x.id === state.selectedId);
   if (!s) { state.view = "list"; render(); return; }
   const lines = state.ptyLines.map((l) => `<div class="line">${escapeHtml(l)}</div>`).join("");
+  const pr = state.permissionRequests[s.id];
+  const isAwaiting = s.status === "awaiting_permission" || pr;
+  const promptBlock = isAwaiting ? `
+    <div class="prompt-banner">
+      <div class="prompt-title">⚠ needs you${pr && pr.tool_name ? ` · <span class="tool">${escapeHtml(pr.tool_name)}</span>` : ""}</div>
+      <div class="prompt-actions">
+        <button class="prompt-btn allow" data-keys="1\\r">1 · Yes</button>
+        <button class="prompt-btn allow-all" data-keys="2\\r">2 · Yes, always</button>
+        <button class="prompt-btn deny" data-keys="3\\r">3 · No</button>
+      </div>
+    </div>` : "";
   const root = el(`
     <div class="app" id="app">
       <div class="detail-bar">
@@ -280,11 +379,13 @@ function renderDetail() {
         <button class="menu" aria-label="Menu">⋯</button>
       </div>
       <div class="view">
+        ${promptBlock}
         <div class="pty" id="pty">${lines}</div>
         <div class="chips">
           <button class="chip" data-keys="\\r">⏎ Enter</button>
           <button class="chip" data-keys="1">1</button>
           <button class="chip" data-keys="2">2</button>
+          <button class="chip" data-keys="3">3</button>
           <button class="chip" data-keys="\\u001b">Esc</button>
           <button class="chip" data-keys="\\u001b[A">↑</button>
           <button class="chip" data-keys="\\u001b[B">↓</button>
@@ -301,7 +402,7 @@ function renderDetail() {
   const pty = root.querySelector("#pty");
   pty.scrollTop = pty.scrollHeight;
   root.querySelector(".back").addEventListener("click", () => { state.view = "list"; state.selectedId = null; render(); });
-  root.querySelectorAll(".chip").forEach((c) => {
+  root.querySelectorAll(".chip, .prompt-btn").forEach((c) => {
     c.addEventListener("click", () => sendKeys(decodeKeys(c.dataset.keys)));
   });
   root.querySelector("#form").addEventListener("submit", (e) => {
@@ -346,13 +447,44 @@ function stateLabel(s) {
   }
 }
 
+// ---- Deep-link from notification --------------------------------------------
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const d = e.data || {};
+    if (d.kind === "deeplink" && d.session_id) {
+      openSession(d.session_id);
+    }
+  });
+}
+
+function readDeepLinkFromQuery() {
+  const u = new URL(location.href);
+  return u.searchParams.get("session");
+}
+
 // ---- Boot -------------------------------------------------------------------
 
 (async () => {
-  const paired = await tryAutoPair();
+  await tryAutoPair();
   if (state.token) {
     connectWS();
-    ensureNotificationPermission();
+    await ensureNotificationPermission();
+    ensurePushSubscription();
+    const deep = readDeepLinkFromQuery();
+    if (deep) {
+      // Defer until WS delivers a snapshot; openSession will subscribe when
+      // we have ws.readyState === 1. Best-effort:
+      const tryOpen = () => {
+        if (state.ws && state.ws.readyState === 1) {
+          openSession(deep);
+          history.replaceState({}, "", "/");
+        } else {
+          setTimeout(tryOpen, 200);
+        }
+      };
+      tryOpen();
+    }
   }
   render();
 })();

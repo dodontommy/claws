@@ -107,6 +107,23 @@
   }
   .chip:active { background: var(--line); }
 
+  /* Permission prompt banner — shown above the PTY when status is awaiting_permission. */
+  .prompt-banner {
+    background: var(--panel); border-bottom: 1px solid var(--warn);
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .prompt-title { color: var(--warn); font-weight: 700; font-size: 14px; }
+  .prompt-title .tool { color: var(--fg); font-weight: 600; }
+  .prompt-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .prompt-btn {
+    flex: 1; min-width: 100px; border: none; border-radius: 8px;
+    padding: 12px 10px; font-weight: 600; font-size: 14px;
+  }
+  .prompt-btn.allow { background: var(--good); color: var(--bg); }
+  .prompt-btn.allow-all { background: var(--accent); color: var(--bg); }
+  .prompt-btn.deny { background: var(--bad); color: var(--bg); }
+  .prompt-btn:active { opacity: 0.85; }
+
   /* Pairing */
   .pair { padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 16px; height: 100%; justify-content: center; }
   .pair h1 { margin: 0; font-size: 18px; }

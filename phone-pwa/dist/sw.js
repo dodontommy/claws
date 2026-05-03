@@ -1,7 +1,6 @@
-// claws phone — service worker. Phase 1: offline shell only.
-// Phase 3 wires Web Push (push, notificationclick) here.
+// claws phone — service worker. Offline shell + Web Push handler.
 
-const CACHE = "claws-shell-v1";
+const CACHE = "claws-shell-v2";
 const SHELL = ["/", "/index.html", "/app.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
@@ -50,5 +49,44 @@ self.addEventListener("fetch", (e) => {
     } catch {
       return cached || new Response("offline", { status: 503 });
     }
+  })());
+});
+
+// ---- Web Push ---------------------------------------------------------------
+
+self.addEventListener("push", (event) => {
+  // Daemon payload: { kind, session_id, title, body }. Tag by session_id so a
+  // burst of awaiting_permission events on the same session collapses into
+  // one notification instead of stacking.
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch {}
+  const title = data.title || "claws";
+  const body = data.body || "";
+  const sid = data.session_id || "";
+  const tag = sid ? `claws:${sid}` : "claws";
+  event.waitUntil(self.registration.showNotification(title, {
+    body,
+    tag,
+    renotify: true,
+    icon: "/icon.svg",
+    badge: "/icon.svg",
+    data: { session_id: sid, kind: data.kind || "" },
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const sid = event.notification.data && event.notification.data.session_id;
+  const url = sid ? `/?session=${encodeURIComponent(sid)}` : "/";
+  event.waitUntil((async () => {
+    const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    // If a claws tab is open, focus it and post the deep-link.
+    for (const c of all) {
+      if (c.url && new URL(c.url).origin === location.origin) {
+        c.postMessage({ kind: "deeplink", session_id: sid });
+        return c.focus();
+      }
+    }
+    return self.clients.openWindow(url);
   })());
 });
