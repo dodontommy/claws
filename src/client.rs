@@ -169,6 +169,16 @@ async fn call_with_autospawn(method: &str, params: Value) -> Result<Response> {
     rpc_round_trip(stream, method, params).await
 }
 
+/// Generic call used by `claws phone …` and other small subcommands that
+/// just want the result Value out without bespoke parsing per call site.
+pub async fn call(method: &str, params: Value) -> Result<Value> {
+    let resp = call_with_autospawn(method, params).await?;
+    if let Some(e) = resp.error {
+        return Err(anyhow!("{}: {}", e.code, e.message));
+    }
+    Ok(resp.result.unwrap_or(Value::Null))
+}
+
 pub(crate) async fn call_no_spawn(method: &str, params: Value) -> Result<Response> {
     let stream = connect_once().await?;
     rpc_round_trip(stream, method, params).await

@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="theme-color" content="#1e1e2e" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="claws" />
+<link rel="manifest" href="/manifest.webmanifest" />
+<link rel="icon" type="image/svg+xml" href="/icon.svg" />
+<link rel="apple-touch-icon" href="/icon-180.png" />
+<link rel="stylesheet" href="/vendor/xterm/xterm.css" />
+<title>claws</title>
+<style>
+  :root {
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", "Consolas", monospace;
+  }
+  /* Theme palettes — same set as the TUI. RGB triples for `--accent` are
+     duplicated in `--accent-rgb` so we can derive the dim accent-bg via
+     rgba(); CSS variables can't be interpolated mid-color without that. */
+
+  /* Default — vivid ANSI-style cyan scheme. */
+  :root, [data-theme="default"] {
+    --bg: #0c0c14;
+    --bg2: #14141c;
+    --panel: #1f1f2c;
+    --line: #2e2e3a;
+    --line-soft: #1f1f2c;
+    --fg: #e6e6e6;
+    --dim: #b4b4b4;
+    --muted: #6f6f7c;
+    --accent: #5cdfdf;
+    --accent-rgb: 92, 223, 223;
+    --good: #5fd75f;
+    --warn: #d7d75f;
+    --bad: #d75f5f;
+    --danger: #ff8c5c;
+  }
+  [data-theme="catppuccin"] {
+    --bg: #1e1e2e;
+    --bg2: #181825;
+    --panel: #313244;
+    --line: #45475a;
+    --line-soft: #313244;
+    --fg: #cdd6f4;
+    --dim: #bac2de;
+    --muted: #6c7086;
+    --accent: #94e2d5;
+    --accent-rgb: 148, 226, 213;
+    --good: #a6e3a1;
+    --warn: #f9e2af;
+    --bad: #f38ba8;
+    --danger: #fab387;
+  }
+  [data-theme="tokyo-night"] {
+    --bg: #1a1b26;
+    --bg2: #16161e;
+    --panel: #292e42;
+    --line: #414868;
+    --line-soft: #292e42;
+    --fg: #c0caf5;
+    --dim: #a9b1d6;
+    --muted: #565f89;
+    --accent: #7dcfff;
+    --accent-rgb: 125, 207, 255;
+    --good: #9ece6a;
+    --warn: #e0af68;
+    --bad: #f7768e;
+    --danger: #ff9e64;
+  }
+  [data-theme="nord"] {
+    --bg: #2e3440;
+    --bg2: #282c34;
+    --panel: #3b4252;
+    --line: #4c566a;
+    --line-soft: #3b4252;
+    --fg: #eceff4;
+    --dim: #d8dee9;
+    --muted: #6b7484;
+    --accent: #88c0d0;
+    --accent-rgb: 136, 192, 208;
+    --good: #a3be8c;
+    --warn: #ebcb8b;
+    --bad: #bf616a;
+    --danger: #d08770;
+  }
+  [data-theme="mono"] {
+    --bg: #0e0e0e;
+    --bg2: #1a1a1a;
+    --panel: #262626;
+    --line: #3a3a3a;
+    --line-soft: #262626;
+    --fg: #f5f5f5;
+    --dim: #bebebe;
+    --muted: #646464;
+    --accent: #dcdcdc;
+    --accent-rgb: 220, 220, 220;
+    --good: #d0d0d0;
+    --warn: #f0f0f0;
+    --bad: #c8c8c8;
+    --danger: #a0a0a0;
+  }
+  :root, [data-theme] {
+    /* Derived: accent-bg uses the rgb triple so it inherits with the theme. */
+    --accent-bg: rgba(var(--accent-rgb), 0.12);
+  }
+  html, body { background: var(--bg); color: var(--fg); }
+  body {
+    margin: 0;
+    /* Monospace everywhere — this is a terminal app. */
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.4;
+    /* svh = small viewport height — locked at "URL bar visible" size.
+       dvh would track the URL bar's collapse/expand, making the whole
+       layout jitter while you scroll. svh is stable. */
+    height: 100svh;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+  }
+  * { box-sizing: border-box; }
+  button { font: inherit; color: inherit; cursor: pointer; background: none; border: none; padding: 0; }
+  input, textarea { font: inherit; color: inherit; }
+  ::selection { background: var(--accent); color: var(--bg); }
+  .app {
+    display: flex; flex-direction: column;
+    height: 100svh; background: var(--bg);
+    padding-top: env(safe-area-inset-top);
+    /* Bottom padding includes both the iOS safe-area inset (home bar)
+       AND a `--keyboard-inset` we set in app.js from visualViewport when
+       the soft keyboard is up. The flex column (header + view) shrinks
+       to the keyboard-free area, xterm scrolls to cursor naturally,
+       and the user can see what they're typing. */
+    padding-bottom: calc(env(safe-area-inset-bottom) + var(--keyboard-inset, 0px));
+  }
+
+  /* ---- Top bar: TUI-style label + status counts + connection ------------ */
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; background: var(--bg2);
+    border-bottom: 1px solid var(--line);
+  }
+  header .brand {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--accent); font-weight: 700;
+  }
+  header .brand::before {
+    content: "▎";
+    color: var(--accent);
+  }
+  header .counts {
+    flex: 1; display: flex; gap: 10px; color: var(--dim);
+    font-size: 13px; align-items: center;
+  }
+  header .counts .c { white-space: nowrap; }
+  header .counts .c.working .glyph { color: var(--good); }
+  header .counts .c.awaiting .glyph { color: var(--warn); }
+  header .counts .c.idle .glyph { color: var(--accent); }
+  header .counts .c.exited .glyph { color: var(--muted); }
+  header .conn {
+    font-size: 11px; padding: 2px 6px;
+    border: 1px solid var(--line); color: var(--muted);
+    text-transform: lowercase;
+  }
+  header .conn.live { color: var(--good); border-color: var(--good); }
+  header .conn.gone { color: var(--bad); border-color: var(--bad); }
+  header .hdr-btn {
+    color: var(--accent); border: 1px solid var(--line);
+    padding: 2px 10px; font-weight: 700; font-size: 16px;
+    line-height: 1.2;
+  }
+  header .hdr-btn:active { background: var(--accent-bg); }
+
+  .view { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+
+  /* ---- List view: ratatui-style rows with `›` active marker ------------ */
+  .list { flex: 1; overflow-y: auto; }
+  .list-section {
+    color: var(--accent); font-weight: 700; font-size: 12px;
+    padding: 10px 12px 6px; letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .list-section::before { content: "▎ "; }
+  .row {
+    display: grid;
+    grid-template-columns: 14px 1fr auto;
+    align-items: baseline;
+    gap: 10px;
+    padding: 10px 12px;
+    border-left: 2px solid transparent;
+    -webkit-tap-highlight-color: transparent;
+    cursor: pointer;
+  }
+  .row:active, .row.active { background: var(--accent-bg); border-left-color: var(--accent); }
+  .row .marker {
+    color: var(--muted);
+    font-weight: 700;
+  }
+  .row .marker .glyph { font-size: 14px; }
+  .row.streaming .marker .glyph { color: var(--good); }
+  .row.awaiting_permission .marker .glyph { color: var(--warn); }
+  .row.idle .marker .glyph { color: var(--accent); }
+  .row.spawning .marker .glyph { color: var(--dim); }
+  .row.exited .marker .glyph { color: var(--muted); }
+  .row.resume_failed .marker .glyph { color: var(--bad); }
+
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .row.streaming .marker .glyph,
+  .row.awaiting_permission .marker .glyph { animation: pulse 1.4s infinite; }
+
+  .row .meta { min-width: 0; }
+  .row .name {
+    font-weight: 700; color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .row .sub {
+    font-size: 12px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .row .state {
+    font-size: 11px; color: var(--dim);
+    text-transform: lowercase; white-space: nowrap;
+    align-self: center;
+  }
+  .row.awaiting_permission .state { color: var(--warn); }
+  .row.streaming .state { color: var(--good); }
+  .row.exited .state { color: var(--muted); }
+  .row .danger {
+    color: var(--danger); margin-left: 6px;
+    font-weight: 700;
+  }
+
+  /* ---- Detail view ----------------------------------------------------- */
+  .detail-bar {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--line);
+  }
+  .detail-bar .back, .detail-bar .menu {
+    color: var(--accent);
+    border: 1px solid var(--line);
+    padding: 2px 10px;
+    font-weight: 700;
+    line-height: 1.4;
+  }
+  .detail-bar .back:active, .detail-bar .menu:active { background: var(--accent-bg); }
+  .detail-bar .name {
+    font-weight: 700; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .detail-bar .name .sep { color: var(--muted); margin: 0 6px; font-weight: 400; }
+  .detail-bar .name .state-tag {
+    color: var(--dim); font-weight: 400; font-size: 12px;
+  }
+  .detail-bar .name .state-tag.streaming { color: var(--good); }
+  .detail-bar .name .state-tag.awaiting_permission { color: var(--warn); }
+
+  .pty-mount {
+    flex: 1; min-height: 0; background: #000;
+    position: relative; overflow: hidden;
+    border-bottom: 1px solid var(--line);
+  }
+  .term-host { width: 100%; height: 100%; padding: 6px 8px 0; }
+  .term-host[hidden] { display: none !important; }
+  .term-host .xterm { padding: 0; height: 100%; }
+  .term-host .xterm-viewport { background: transparent !important; }
+  .term-host .xterm-screen { background: transparent !important; }
+  .term-host .xterm-viewport::-webkit-scrollbar { width: 4px; }
+  .term-host .xterm-viewport::-webkit-scrollbar-thumb { background: var(--line); }
+
+  /* ---- Chips: kbd-style key hints, no rounded corners ------------------ */
+  .chips {
+    display: flex; gap: 6px;
+    padding: 6px 8px;
+    overflow-x: auto;
+    background: var(--bg2);
+    border-top: 1px solid var(--line-soft);
+  }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--fg);
+    padding: 5px 10px;
+    font: 12px var(--mono);
+    white-space: nowrap;
+    line-height: 1.5;
+  }
+  .chip:active { background: var(--line); }
+  .chip[data-action="focus"] {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  /* ---- Permission prompt banner (TUI awaiting-attention style) ---------- */
+  .prompt-banner {
+    background: var(--bg2);
+    border-bottom: 2px solid var(--warn);
+    padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .prompt-title {
+    color: var(--warn); font-weight: 700; font-size: 13px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .prompt-title::before { content: "▎ "; }
+  .prompt-title .tool { color: var(--fg); font-weight: 700; text-transform: none; letter-spacing: 0; }
+  .prompt-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .prompt-btn {
+    flex: 1; min-width: 84px;
+    border: 1px solid;
+    padding: 10px 8px;
+    font: 700 13px var(--mono);
+    line-height: 1.2;
+  }
+  .prompt-btn.allow      { color: var(--good);   border-color: var(--good); }
+  .prompt-btn.allow-all  { color: var(--accent); border-color: var(--accent); }
+  .prompt-btn.deny       { color: var(--bad);    border-color: var(--bad); }
+  .prompt-btn:active { background: var(--panel); }
+
+  /* ---- Bottom-sheet spawn form (TUI modal style) ----------------------- */
+  .sheet-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: flex; align-items: flex-end; justify-content: center;
+    z-index: 100; padding-bottom: env(safe-area-inset-bottom);
+  }
+  .sheet {
+    width: 100%; background: var(--bg2);
+    border-top: 2px solid var(--accent);
+    padding: 14px 14px 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    max-height: 88dvh; overflow-y: auto;
+  }
+  .sheet-title {
+    color: var(--accent); font-weight: 700;
+    font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.04em; margin-bottom: 4px;
+  }
+  .sheet-title::before { content: "▎ "; }
+  .sheet-label {
+    font-size: 11px; color: var(--dim);
+    margin-top: 10px; text-transform: lowercase;
+  }
+  .sheet-label .sheet-hint { color: var(--muted); }
+  .sheet-input {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--fg);
+    padding: 9px 10px; outline: none;
+    font: 14px var(--mono);
+  }
+  .sheet-input:focus { border-color: var(--accent); }
+  .model-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .model-pill {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--dim);
+    padding: 6px 12px;
+    font: 13px var(--mono);
+  }
+  .model-pill.selected {
+    background: var(--accent-bg);
+    color: var(--accent);
+    border-color: var(--accent);
+    font-weight: 700;
+  }
+  .sheet-err { color: var(--bad); font-size: 12px; margin-top: 4px; }
+  .sheet-actions { display: flex; gap: 6px; margin-top: 14px; }
+  .sheet-cancel, .sheet-submit {
+    flex: 1; padding: 10px;
+    font: 700 13px var(--mono);
+    border: 1px solid;
+    text-transform: lowercase;
+  }
+  .sheet-cancel { color: var(--dim); border-color: var(--line); background: var(--panel); }
+  .sheet-submit { color: var(--accent); border-color: var(--accent); }
+  .sheet-submit:active { background: var(--accent-bg); }
+  .sheet-submit:disabled { opacity: 0.5; }
+
+  /* ---- Theme picker (TUI t-key analogue) ------------------------------ */
+  .theme-list { display: flex; flex-direction: column; gap: 0; margin-top: 4px; }
+  .theme-row {
+    display: grid;
+    grid-template-columns: 16px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 4px;
+    border: none;
+    background: transparent;
+    text-align: left;
+    -webkit-tap-highlight-color: transparent;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .theme-row:last-child { border-bottom: none; }
+  .theme-row.active { color: var(--accent); }
+  .theme-row .marker {
+    font-weight: 700; color: var(--accent); text-align: center;
+  }
+  .theme-row .label { font: 13px var(--mono); }
+  .theme-row .swatches { display: flex; gap: 4px; }
+  .theme-row .swatches .sw {
+    width: 12px; height: 12px; border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  /* Each preview swatch container declares its own --good/--warn/etc so
+     they show that theme's colors regardless of the active palette. */
+  [data-theme-preview="default"] {
+    --p-good:#5fd75f; --p-warn:#d7d75f; --p-bad:#d75f5f;
+    --p-accent:#5cdfdf; --p-cost:#5fd75f;
+  }
+  [data-theme-preview="catppuccin"] {
+    --p-good:#a6e3a1; --p-warn:#f9e2af; --p-bad:#f38ba8;
+    --p-accent:#94e2d5; --p-cost:#a6e3a1;
+  }
+  [data-theme-preview="tokyo-night"] {
+    --p-good:#9ece6a; --p-warn:#e0af68; --p-bad:#f7768e;
+    --p-accent:#7dcfff; --p-cost:#9ece6a;
+  }
+  [data-theme-preview="nord"] {
+    --p-good:#a3be8c; --p-warn:#ebcb8b; --p-bad:#bf616a;
+    --p-accent:#88c0d0; --p-cost:#a3be8c;
+  }
+  [data-theme-preview="mono"] {
+    --p-good:#dcdcdc; --p-warn:#f0f0f0; --p-bad:#c8c8c8;
+    --p-accent:#dcdcdc; --p-cost:#a0a0a0;
+  }
+  .sw-good   { background: var(--p-good); }
+  .sw-warn   { background: var(--p-warn); }
+  .sw-bad    { background: var(--p-bad); }
+  .sw-accent { background: var(--p-accent); }
+  .sw-cost   { background: var(--p-cost); }
+
+  /* ---- Pair screen: TUI dialog ----------------------------------------- */
+  .pair {
+    padding: 24px 16px;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 14px; height: 100%; justify-content: center;
+    text-align: center;
+  }
+  .pair-logo {
+    color: var(--accent); font-weight: 700;
+    font-size: 28px; letter-spacing: 0.06em;
+    margin-bottom: 4px;
+  }
+  .pair h1 {
+    margin: 0; font-size: 13px;
+    color: var(--accent); text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .pair p {
+    color: var(--dim); max-width: 320px; margin: 0;
+    line-height: 1.5; font-size: 13px;
+  }
+  .pair input {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    padding: 10px 12px;
+    width: 100%; max-width: 320px; outline: none;
+    font: 14px var(--mono);
+    text-align: center; letter-spacing: 0.06em;
+  }
+  .pair input:focus { border-color: var(--accent); }
+  .pair button {
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 10px 20px;
+    font: 700 13px var(--mono);
+    width: 100%; max-width: 320px;
+    text-transform: lowercase;
+  }
+  .pair button:active { background: var(--accent-bg); }
+  .pair .err { color: var(--bad); font-size: 12px; }
+
+  /* ---- Empty state ----------------------------------------------------- */
+  .empty {
+    color: var(--muted); text-align: center;
+    padding: 60px 20px; font-size: 13px;
+  }
+  .empty pre {
+    color: var(--line); font-family: var(--mono);
+    margin: 0 0 16px;
+  }
+
+  /* Ace-style iOS input proxy. 1×1 fixed in the viewport so its geometry
+     never changes; opacity 0 + pointer-events none so it's invisible and
+     untouchable. Focus is summoned synchronously from a touchend handler
+     on the terminal host, not from tapping this element. Pinned at 50%
+     viewport height because top:0 is hidden under the iPhone notch and
+     iOS reacts by scrolling the whole page up to bring it into view —
+     which dragged the detail-bar into the unsafe area. Mid-viewport
+     means it's always already in view, no scroll-into-view kicks in. */
+  #ios-input {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    resize: none;
+    pointer-events: none;
+    z-index: 1;
+    /* font-size: 16px is required to keep iOS from auto-zooming on focus. */
+    font-size: 16px;
+  }
+</style>
+</head>
+<body>
+<!-- iOS keyboard input proxy, Ace editor pattern (src/keyboard/textinput.js).
+     Positioned fixed at viewport top, 1x1 transparent, never reparented.
+     iOS Safari dismisses the keyboard if the focused element's geometry
+     changes, gets reparented, OR its value gets set to "". We satisfy
+     all three rules: position is fixed independent of ancestor reflow,
+     this element lives at body root and never moves, and the value
+     cycles only between PLACEHOLDER and PLACEHOLDER+keystrokes (see
+     app.js). Decoupled from #app so xterm's render loop can't disturb it. -->
+<textarea
+  id="ios-input"
+  autocomplete="off"
+  autocorrect="off"
+  autocapitalize="off"
+  spellcheck="false"
+  wrap="off"
+  aria-hidden="true"
+  tabindex="-1"></textarea>
+<!-- Self-nuke. Visit `?reset=1` to unregister the service worker and
+     drop all caches before any other script loads. Lives inline because
+     a stale cached app.js would otherwise prevent its own replacement. -->
+<script>
+  (function () {
+    if (!new URL(location.href).searchParams.get("reset")) return;
+    document.body.innerText = "resetting…";
+    (async () => {
+      try {
+        if ("serviceWorker" in navigator) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        }
+        if (window.caches) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+      } catch (e) { /* best effort */ }
+      location.replace("/");
+    })();
+    // Halt the rest of body parsing — the unregister + reload finishes the job.
+    throw new Error("claws PWA reset");
+  })();
+</script>
+<div id="app" class="app"></div>
+<!-- xterm.js terminal host. Lives outside #app so the rerender loop in
+     app.js doesn't tear down its DOM (xterm manages its own internals
+     and breaks if its node is replaced). It's hidden when not in detail
+     view and re-parented into #pty-mount when entering one. -->
+<div id="term-host" class="term-host" hidden></div>
+<script src="/vendor/xterm/xterm.js"></script>
+<script src="/vendor/xterm/xterm-addon-fit.js"></script>
+<script type="module" src="/app.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch((e) => console.warn('sw register failed', e));
+    });
+  }
+</script>
+</body>
+</html>

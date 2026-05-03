@@ -1,6 +1,7 @@
 use crate::hook;
 use crate::paths;
 use crate::persist::Store;
+use crate::phone::{self, PhoneHandle};
 use crate::protocol::*;
 use crate::registry::SessionRegistry;
 use crate::session::{spawn_session, Session, SpawnMode};
@@ -66,11 +67,34 @@ pub async fn run() -> Result<()> {
 
     auto_resume(&store, &registry).await;
 
+    // Phone listener: auto-start if previously enabled. Failures here don't
+    // block the daemon — the user can re-run `claws phone start` to retry.
+    let phone_handle: Arc<tokio::sync::Mutex<Option<PhoneHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    {
+        let persisted = phone::load_state();
+        if persisted.enabled {
+            let bind = phone::parse_bind(&persisted.bind).unwrap_or_else(|_| {
+                phone::parse_bind("").expect("default bind always parses")
+            });
+            match phone::start(bind, registry.clone(), store.clone()).await {
+                Ok(h) => {
+                    tracing::info!(bind = %h.bind, "phone listener auto-started");
+                    *phone_handle.lock().await = Some(h);
+                }
+                Err(e) => tracing::warn!(error = %e, "phone auto-start failed"),
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
             _ = shutdown.notified() => {
                 tracing::info!("daemon shutting down, closing all sessions");
+                if let Some(h) = phone_handle.lock().await.take() {
+                    h.stop();
+                }
                 registry.close_all();
                 break;
             }
@@ -81,8 +105,9 @@ pub async fn run() -> Result<()> {
                         let reg = registry.clone();
                         let st = store.clone();
                         let tok = auth_token.clone();
+                        let ph = phone_handle.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, tok, reg, st, sd).await {
+                            if let Err(e) = handle_client(stream, tok, reg, st, sd, ph).await {
                                 tracing::warn!(error = %e, "client connection closed");
                             }
                         });
@@ -217,6 +242,7 @@ async fn handle_client(
     registry: SessionRegistry,
     store: Store,
     shutdown: Arc<Notify>,
+    phone_handle: Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
@@ -239,7 +265,7 @@ async fn handle_client(
                 continue;
             }
         };
-        let resp = dispatch(&req, &auth_token, &registry, &store, &shutdown).await;
+        let resp = dispatch(&req, &auth_token, &registry, &store, &shutdown, &phone_handle).await;
         let mut out = serde_json::to_string(&resp)?;
         out.push('\n');
         writer.write_all(out.as_bytes()).await?;
@@ -253,6 +279,7 @@ async fn dispatch(
     registry: &SessionRegistry,
     store: &Store,
     shutdown: &Notify,
+    phone_handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
 ) -> Response {
     // Constant-time-ish equality on the auth token. UUID tokens are short
     // and the secret comparison isn't truly time-constant in pure Rust,
@@ -309,8 +336,179 @@ async fn dispatch(
             Ok(p) => handle_restart(req.id, p, registry, store).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
+        "phone_status" => handle_phone_status(req.id, phone_handle).await,
+        "phone_start" => handle_phone_start(req.id, &req.params, phone_handle, registry, store).await,
+        "phone_stop" => handle_phone_stop(req.id, phone_handle).await,
+        "phone_pair_code" => handle_phone_pair_code(req.id, &req.params, phone_handle).await,
+        "phone_devices" => handle_phone_devices(req.id, phone_handle).await,
+        "phone_revoke" => handle_phone_revoke(req.id, &req.params, phone_handle).await,
         other => err(req.id, RpcError::method_not_found(other)),
     }
+}
+
+async fn handle_phone_status(
+    id: u64,
+    handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
+) -> Response {
+    let h = handle.lock().await;
+    let persisted = phone::load_state();
+    let result = json!({
+        "running": h.is_some(),
+        "bind": h.as_ref().map(|h| h.bind.to_string()),
+        "enabled_persisted": persisted.enabled,
+        "device_count": persisted.devices.len(),
+    });
+    ok(id, result)
+}
+
+async fn handle_phone_start(
+    id: u64,
+    params: &serde_json::Value,
+    handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
+    registry: &SessionRegistry,
+    store: &Store,
+) -> Response {
+    let bind_str = params
+        .get("bind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let bind = match phone::parse_bind(&bind_str) {
+        Ok(a) => a,
+        Err(e) => return err(id, RpcError::invalid_params(e.to_string())),
+    };
+    // Optional pwa_dir: persist immediately so it takes effect even if the
+    // listener is already running (the static handler reads it per-request).
+    // Empty string clears the override.
+    let pwa_dir_param = params.get("pwa_dir").and_then(|v| v.as_str());
+    if let Some(d) = pwa_dir_param {
+        let mut s = phone::load_state();
+        s.pwa_dir = if d.is_empty() { None } else { Some(d.to_string()) };
+        if let Err(e) = phone::save_state(&s) {
+            return err(id, RpcError::internal(format!("could not persist pwa_dir: {e:#}")));
+        }
+        // If the listener is up, push the new value into its in-memory state
+        // too so we don't have to wait for a daemon restart to read the
+        // freshly-persisted file.
+        if let Some(h) = handle.lock().await.as_ref() {
+            h.set_pwa_dir(s.pwa_dir.clone()).await;
+        }
+    }
+    let mut g = handle.lock().await;
+    if let Some(existing) = g.as_ref() {
+        return ok(id, json!({
+            "already_running": true,
+            "bind": existing.bind.to_string()
+        }));
+    }
+    match phone::start(bind, registry.clone(), store.clone()).await {
+        Ok(h) => {
+            let bind = h.bind.to_string();
+            *g = Some(h);
+            ok(id, json!({"bind": bind}))
+        }
+        Err(e) => err(id, RpcError::internal(format!("phone start failed: {e:#}"))),
+    }
+}
+
+async fn handle_phone_stop(
+    id: u64,
+    handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
+) -> Response {
+    let mut g = handle.lock().await;
+    let stopped = if let Some(h) = g.take() {
+        h.stop();
+        true
+    } else {
+        false
+    };
+    // Persist disabled.
+    let mut s = phone::load_state();
+    s.enabled = false;
+    let _ = phone::save_state(&s);
+    ok(id, json!({"stopped": stopped}))
+}
+
+async fn handle_phone_pair_code(
+    id: u64,
+    params: &serde_json::Value,
+    handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
+) -> Response {
+    // Optional `set_url` param: persist a public URL the phone can reach.
+    // Set once, reused for every future pair until the user sets another.
+    let set_url = params
+        .get("set_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let g = handle.lock().await;
+    let h = match g.as_ref() {
+        Some(h) => h,
+        None => {
+            return err(
+                id,
+                RpcError::internal(
+                    "phone listener not running; run `claws phone start` first",
+                ),
+            )
+        }
+    };
+    if let Some(u) = set_url.as_ref() {
+        h.set_public_url(u.clone()).await;
+    }
+    let code = h.mint_pair_code().await;
+    let public_url = h.resolve_public_url().await;
+    ok(
+        id,
+        json!({
+            "code": code,
+            "bind": h.bind.to_string(),
+            "ttl_secs": 600,
+            "public_url": public_url,
+        }),
+    )
+}
+
+async fn handle_phone_devices(
+    id: u64,
+    handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
+) -> Response {
+    let devices = if let Some(h) = handle.lock().await.as_ref() {
+        h.devices().await
+    } else {
+        phone::load_state().devices
+    };
+    ok(id, serde_json::to_value(devices).unwrap_or(json!([])))
+}
+
+async fn handle_phone_revoke(
+    id: u64,
+    params: &serde_json::Value,
+    handle: &Arc<tokio::sync::Mutex<Option<PhoneHandle>>>,
+) -> Response {
+    let did = params
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let did = match did {
+        Some(d) => d,
+        None => return err(id, RpcError::invalid_params("device_id required")),
+    };
+    let removed = if let Some(h) = handle.lock().await.as_ref() {
+        h.revoke(did).await
+    } else {
+        // Listener down: edit the persisted state directly.
+        let mut s = phone::load_state();
+        let before = s.devices.len();
+        s.devices.retain(|d| d.id != did);
+        let removed = s.devices.len() != before;
+        if removed {
+            let _ = phone::save_state(&s);
+        }
+        removed
+    };
+    ok(id, json!({"removed": removed}))
 }
 
 async fn handle_create(
@@ -319,18 +517,38 @@ async fn handle_create(
     reg: &SessionRegistry,
     store: &Store,
 ) -> Response {
+    match create_session_into_registry(p, reg, store).await {
+        Ok(info) => ok(id, serde_json::to_value(info).unwrap()),
+        Err(CreateError::InvalidParams(m)) => err(id, RpcError::invalid_params(m)),
+        Err(CreateError::Internal(m)) => err(id, RpcError::internal(m)),
+    }
+}
+
+pub enum CreateError {
+    InvalidParams(String),
+    Internal(String),
+}
+
+/// Spawn a fresh session, persist it, insert it into the registry. Used by
+/// the unix-socket dispatch and by the phone module's HTTP `POST /api/sessions`.
+/// Both call sites share the same retry-and-persist logic this function owns.
+pub async fn create_session_into_registry(
+    p: CreateSessionParams,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> std::result::Result<SessionInfo, CreateError> {
     tracing::info!(cwd = %p.cwd, name = ?p.name, model = ?p.model, "create_session: begin");
     let cwd = PathBuf::from(&p.cwd);
     if !cwd.is_dir() {
-        return err(
-            id,
-            RpcError::invalid_params(format!("cwd does not exist or is not a directory: {}", p.cwd)),
-        );
+        return Err(CreateError::InvalidParams(format!(
+            "cwd does not exist or is not a directory: {}",
+            p.cwd
+        )));
     }
 
     let session_id = Uuid::new_v4();
     let settings_path = match hook::write_settings_for(session_id) {
-        Ok(p) => Some(p),
+        Ok(sp) => Some(sp),
         Err(e) => {
             tracing::warn!(error = %e, "failed to write hook settings; spawning without hooks");
             None
@@ -358,9 +576,9 @@ async fn handle_create(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::error!(error = ?e, "spawn_session failed");
-            return err(id, RpcError::internal(format!("spawn failed: {e:#}")));
+            return Err(CreateError::Internal(format!("spawn failed: {e:#}")));
         }
-        Err(e) => return err(id, RpcError::internal(format!("join failed: {e}"))),
+        Err(e) => return Err(CreateError::Internal(format!("join failed: {e}"))),
     };
     tracing::info!(session_id = %session.id, "create_session: spawn returned");
     let info = session_info(&session);
@@ -377,7 +595,7 @@ async fn handle_create(
     }
 
     reg.insert(session);
-    ok(id, serde_json::to_value(info).unwrap())
+    Ok(info)
 }
 
 async fn handle_list(id: u64, reg: &SessionRegistry) -> Response {
@@ -564,7 +782,7 @@ async fn handle_hook_event(id: u64, p: HookEventParams, reg: &SessionRegistry) -
     }
 }
 
-fn session_info(s: &Session) -> SessionInfo {
+pub fn session_info(s: &Session) -> SessionInfo {
     let snap = s.snapshot();
     let scraped = s.context_status();
     // Prefer scraped context (always reflects what Claude actually shows).

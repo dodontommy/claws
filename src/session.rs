@@ -492,6 +492,7 @@ impl Session {
         Ok(())
     }
 
+
     /// Scrape the daemon-side vt100 screen for Claude's context-fill status,
     /// which appears in its bottom status bar as e.g. `12% 120k/1.0M`. Not
     /// available in the JSONL or hooks — only on screen.
