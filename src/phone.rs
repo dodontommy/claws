@@ -688,6 +688,21 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                             }
                         }
                     }
+                    "resize" => {
+                        let sid = v
+                            .get("session_id")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| Uuid::parse_str(s).ok());
+                        let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+                        let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+                        if let Some(sid) = sid {
+                            if rows >= 4 && cols >= 10 {
+                                if let Some(sess) = state.registry.get(sid) {
+                                    let _ = sess.resize(rows, cols);
+                                }
+                            }
+                        }
+                    }
                     "ping" => {
                         // Keep alive: clients may send these during long idle.
                     }

@@ -9,7 +9,6 @@ const state = {
   view: "list", // "list" | "detail" | "pair"
   selectedId: null,
   sessions: [],
-  ptyLines: [], // for selected session
   ptyNextSeq: 0,
   ws: null,
   wsAlive: false,
@@ -18,6 +17,14 @@ const state = {
   // awaiting_permission. Keyed by session_id.
   permissionRequests: {},
 };
+
+// Persistent xterm.js Terminal. Lives outside the rerender cycle because
+// xterm manages its own DOM and breaks if its node is replaced. We attach
+// it into the detail view's #pty-mount on entry and detach it on exit.
+let term = null;
+let fitAddon = null;
+let termHost = null;
+let termSession = null; // session id whose bytes the terminal currently shows
 
 // ---- Pairing ----------------------------------------------------------------
 
@@ -129,9 +136,9 @@ function handleServerEvent(msg) {
       break;
     case "session.output":
       if (msg.session_id === state.selectedId) {
-        appendPtyChunk(msg.data_b64);
+        writePtyChunkToTerm(msg.data_b64);
         state.ptyNextSeq = msg.next_seq;
-        render();
+        // No render() — xterm has updated itself, the chrome is unchanged.
       }
       break;
     case "session.permission_request":
@@ -167,28 +174,107 @@ function sortSessions() {
   });
 }
 
-// ---- PTY rendering ----------------------------------------------------------
+// ---- xterm integration ------------------------------------------------------
 
-function appendPtyChunk(b64) {
-  const bin = atob(b64);
-  // We don't run a full vt100 emulator client-side in Phase 1 — we strip
-  // common ANSI escape sequences and append. Phase 2 swaps in xterm.js.
-  const text = stripAnsi(bin);
-  const last = state.ptyLines[state.ptyLines.length - 1] ?? "";
-  const merged = last + text;
-  const lines = merged.split(/\r?\n/);
-  state.ptyLines = state.ptyLines.slice(0, -1).concat(lines);
-  // Keep last 500 lines.
-  if (state.ptyLines.length > 500) state.ptyLines = state.ptyLines.slice(-500);
+function ensureTerminal() {
+  if (term) return term;
+  if (typeof Terminal === "undefined") {
+    console.warn("xterm.js not loaded; terminal rendering disabled");
+    return null;
+  }
+  termHost = document.getElementById("term-host");
+  term = new Terminal({
+    convertEol: false,
+    cursorBlink: true,
+    cursorStyle: "block",
+    disableStdin: true, // phone uses chips + input bar; xterm is read-only
+    scrollback: 5000,
+    fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+    fontSize: 12,
+    lineHeight: 1.2,
+    theme: {
+      background: "#000000",
+      foreground: "#cdd6f4",
+      cursor: "#89b4fa",
+      cursorAccent: "#000000",
+      selectionBackground: "#45475a",
+      black: "#181825",
+      red: "#f38ba8",
+      green: "#a6e3a1",
+      yellow: "#f9e2af",
+      blue: "#89b4fa",
+      magenta: "#cba6f7",
+      cyan: "#94e2d5",
+      white: "#cdd6f4",
+      brightBlack: "#45475a",
+      brightRed: "#f38ba8",
+      brightGreen: "#a6e3a1",
+      brightYellow: "#f9e2af",
+      brightBlue: "#89b4fa",
+      brightMagenta: "#cba6f7",
+      brightCyan: "#94e2d5",
+      brightWhite: "#a6adc8",
+    },
+  });
+  if (typeof FitAddon !== "undefined") {
+    fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+  }
+  term.open(termHost);
+  // Re-fit on viewport changes (rotation, keyboard show/hide, install banner).
+  window.addEventListener("resize", () => fitTerm());
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", () => fitTerm());
+  }
+  return term;
 }
 
-function stripAnsi(s) {
-  // Minimal: CSI ... letter, OSC ... BEL, single-char escapes.
-  return s
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b\][^\x07]*\x07/g, "")
-    .replace(/\x1b[=>]/g, "")
-    .replace(/\r/g, "");
+function fitTerm() {
+  if (!fitAddon || !termHost || termHost.hidden) return;
+  try { fitAddon.fit(); } catch {}
+  // Tell the daemon our new size so Claude's TUI re-renders to match.
+  if (term && state.selectedId) {
+    sendWS({ kind: "resize", session_id: state.selectedId, rows: term.rows, cols: term.cols });
+  }
+}
+
+function writePtyChunkToTerm(b64) {
+  const t = ensureTerminal();
+  if (!t) return;
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  t.write(bytes);
+}
+
+function attachTerminalTo(mount) {
+  const t = ensureTerminal();
+  if (!t) return;
+  termHost.hidden = false;
+  if (termHost.parentElement !== mount) mount.appendChild(termHost);
+  // Defer fit until layout settles.
+  requestAnimationFrame(() => {
+    fitTerm();
+    t.scrollToBottom();
+  });
+}
+
+function detachTerminal() {
+  if (!termHost) return;
+  termHost.hidden = true;
+  // Park back on body so it's not destroyed by an #app rerender.
+  if (termHost.parentElement && termHost.parentElement.id !== "term-host-park") {
+    document.body.appendChild(termHost);
+  }
+}
+
+function resetTerminalForSession(id) {
+  const t = ensureTerminal();
+  if (!t) return;
+  if (termSession !== id) {
+    t.reset();
+    termSession = id;
+  }
 }
 
 // ---- Notifications ----------------------------------------------------------
@@ -275,9 +361,13 @@ function urlB64ToUint8Array(b64) {
 // ---- Views ------------------------------------------------------------------
 
 function render() {
-  if (!state.token) { renderPair(); return; }
-  if (state.view === "detail" && state.selectedId) renderDetail();
-  else renderList();
+  if (!state.token) { detachTerminal(); renderPair(); return; }
+  if (state.view === "detail" && state.selectedId) {
+    renderDetail();
+  } else {
+    detachTerminal();
+    renderList();
+  }
 }
 
 function el(html) {
@@ -454,7 +544,6 @@ async function submitSpawn() {
 function renderDetail() {
   const s = state.sessions.find((x) => x.id === state.selectedId);
   if (!s) { state.view = "list"; render(); return; }
-  const lines = state.ptyLines.map((l) => `<div class="line">${escapeHtml(l)}</div>`).join("");
   const pr = state.permissionRequests[s.id];
   const isAwaiting = s.status === "awaiting_permission" || pr;
   const promptBlock = isAwaiting ? `
@@ -475,7 +564,7 @@ function renderDetail() {
       </div>
       <div class="view">
         ${promptBlock}
-        <div class="pty" id="pty">${lines}</div>
+        <div class="pty-mount" id="pty-mount"></div>
         <div class="chips">
           <button class="chip" data-keys="\\r">⏎ Enter</button>
           <button class="chip" data-keys="1">1</button>
@@ -494,9 +583,12 @@ function renderDetail() {
     </div>
   `);
   document.getElementById("app").replaceWith(root);
-  const pty = root.querySelector("#pty");
-  pty.scrollTop = pty.scrollHeight;
-  root.querySelector(".back").addEventListener("click", () => { state.view = "list"; state.selectedId = null; render(); });
+  const mount = root.querySelector("#pty-mount");
+  attachTerminalTo(mount);
+  root.querySelector(".back").addEventListener("click", () => {
+    detachTerminal();
+    state.view = "list"; state.selectedId = null; render();
+  });
   root.querySelectorAll(".chip, .prompt-btn").forEach((c) => {
     c.addEventListener("click", () => sendKeys(decodeKeys(c.dataset.keys)));
   });
@@ -522,8 +614,8 @@ function sendKeys(text) {
 function openSession(id) {
   state.selectedId = id;
   state.view = "detail";
-  state.ptyLines = [];
   state.ptyNextSeq = 0;
+  resetTerminalForSession(id);
   sendWS({ kind: "subscribe", session_id: id, since: 0 });
   render();
 }
