@@ -40,6 +40,9 @@ pub async fn run() -> Result<()> {
 
     let auth_token = Arc::new(crate::auth::write_new_token().context("write auth token")?);
     tracing::info!("auth token written");
+    if let Err(e) = crate::pidfile::write_self() {
+        tracing::warn!(error = %e, "could not write daemon.pid (force-kill won't work)");
+    }
     tracing::info!("daemon listening");
 
     let shutdown = Arc::new(Notify::new());
@@ -80,6 +83,7 @@ pub async fn run() -> Result<()> {
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
+    crate::pidfile::remove();
 
     Ok(())
 }

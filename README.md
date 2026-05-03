@@ -84,6 +84,12 @@ After a reboot the daemon is gone but the JSONL transcripts that Claude itself w
 claws kill-server
 ```
 
+If the daemon is unresponsive (rare — used to happen with an auth-token race we fixed in v0.2.6, but the escape hatch is still nice to have), pass `--force` to PID-kill it:
+
+```sh
+claws kill-server --force
+```
+
 ## Configuration
 
 There isn't really any. Default colors, keymap baked in, sensible behavior on a fresh install. Per-session settings live alongside the spawn (cwd, flags, name, model) and survive across resumes via a small SQLite file in your local data directory.

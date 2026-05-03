@@ -9,6 +9,7 @@ mod git;
 mod hook;
 mod paths;
 mod persist;
+mod pidfile;
 mod protocol;
 mod registry;
 mod ring;
@@ -31,7 +32,13 @@ enum Command {
     /// Send a ping to the daemon (auto-spawns one if needed)
     Ping,
     /// Stop the daemon and all sessions
-    KillServer,
+    KillServer {
+        /// Force-kill the daemon process by PID, bypassing the auth-protected
+        /// shutdown RPC. Use when the daemon is unresponsive or the auth
+        /// token on disk has somehow drifted from what the daemon expects.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the log file path
     Logs,
     /// Spawn a new claude session in the daemon
@@ -91,7 +98,23 @@ fn main() -> Result<()> {
                 tui::run().await
             },
             Some(Command::Ping) => client::ping().await,
-            Some(Command::KillServer) => client::kill_server().await,
+            Some(Command::KillServer { force }) => {
+                if force {
+                    match pidfile::force_kill() {
+                        Ok(true) => {
+                            println!("daemon killed");
+                            Ok(())
+                        }
+                        Ok(false) => {
+                            println!("(no daemon found)");
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    client::kill_server().await
+                }
+            }
             Some(Command::Logs) => {
                 println!("{}", paths::log_file()?.display());
                 Ok(())
