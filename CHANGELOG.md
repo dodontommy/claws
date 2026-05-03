@@ -4,6 +4,18 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.6] — 2026-05-02
+
+### Fixed
+- Daemon-startup race that left the auth token on disk out of sync
+  with the running daemon's in-memory token. Two near-simultaneous
+  daemon-starts (e.g. TUI auto-spawn + a parallel CLI invocation, or
+  the TUI relaunched too quickly) had the second daemon overwrite
+  the first's `auth.token` before failing to bind, after which every
+  client request was rejected by the running daemon as `-32001
+  unauthorized`. Fix: bind the socket first; the failing daemon now
+  exits without ever touching the token file.
+
 ## [0.2.5] — 2026-05-02
 
 ### Changed

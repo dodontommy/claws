@@ -23,11 +23,12 @@ pub async fn run() -> Result<()> {
     #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
 
-    // Generate a fresh per-startup auth token before binding the socket so
-    // the file exists by the time the first client connects.
-    let auth_token = Arc::new(crate::auth::write_new_token().context("write auth token")?);
-    tracing::info!("auth token written");
-
+    // Bind the socket FIRST so a "second daemon trying to start" loses on
+    // bind and exits without ever touching the token file. Writing the token
+    // before binding (the previous order) was a race: two near-simultaneous
+    // starts had the second daemon overwrite the first's token on disk
+    // before failing to bind, leaving every subsequent client request
+    // rejected by the running daemon as -32001 unauthorized.
     let name = sock
         .clone()
         .to_fs_name::<GenericFilePath>()
@@ -36,6 +37,9 @@ pub async fn run() -> Result<()> {
         .name(name)
         .create_tokio()
         .context("failed to bind socket (already in use?)")?;
+
+    let auth_token = Arc::new(crate::auth::write_new_token().context("write auth token")?);
+    tracing::info!("auth token written");
     tracing::info!("daemon listening");
 
     let shutdown = Arc::new(Notify::new());
