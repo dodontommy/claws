@@ -704,12 +704,18 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                 };
                 match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
                     "subscribe" => {
-                        // Spin up a per-client virtual screen sized to the
-                        // phone's viewport, replay the ring buffer through
-                        // it, and emit state_formatted as the initial paint.
-                        // Subsequent ticks emit state_diff (see snap_task).
-                        // The actual PTY size — and what the dev TUI sees —
-                        // is untouched.
+                        // Two things in one: (1) resize the actual PTY to the
+                        // phone's geometry so Claude *itself* redraws for the
+                        // phone — this is what makes TUI elements (status bars,
+                        // box drawings) line up. tmux does the same on attach.
+                        // (2) Spin up a per-client virtual screen at that
+                        // geometry and replay the ring buffer through it, so
+                        // the initial paint is correct without waiting for
+                        // SIGWINCH bytes to land.
+                        //
+                        // Tradeoff: the dev-box TUI viewing the same session
+                        // sees Claude redraw at the phone's size while the
+                        // phone is attached. That's the multi-client cost.
                         let sid = v
                             .get("session_id")
                             .and_then(|x| x.as_str())
@@ -718,6 +724,14 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                         let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(80).max(10) as u16;
                         if let Some(sid) = sid {
                             if let Some(sess) = state.registry.get(sid) {
+                                // Two-step resize forces SIGWINCH twice so Claude
+                                // redraws even if the size happens to match what
+                                // it had before.
+                                let bumped = rows.saturating_sub(1).max(4);
+                                let _ = sess.resize(bumped, cols);
+                                tokio::time::sleep(Duration::from_millis(30)).await;
+                                let _ = sess.resize(rows, cols);
+
                                 let mut parser = vt100::Parser::new(rows, cols, 1000);
                                 let (history, end_cursor) = sess.read_output(0);
                                 if !history.is_empty() {
@@ -762,42 +776,49 @@ async fn handle_ws_socket(state: Arc<AppState>, socket: WebSocket, device_id: Uu
                         }
                     }
                     "resize" => {
-                        // Resize is per-client now: rebuild THIS phone's
-                        // private parser at the new geometry, replay the
-                        // ring through it, and emit a fresh state_formatted.
-                        // We deliberately do NOT touch the actual PTY —
-                        // doing so would yank the dev TUI's render geometry
-                        // out from under it. Per-client parsers are how
-                        // tmux solves this.
+                        // Phone reported a new viewport size (rotation,
+                        // keyboard show/hide, etc). Resize the actual PTY
+                        // (forces Claude to redraw at the new size) AND
+                        // rebuild THIS phone's private parser at the new
+                        // geometry. The dev TUI sees the resize too — same
+                        // tradeoff as the subscribe path; multi-client by
+                        // necessity.
                         let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
                         let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
                         if rows >= 4 && cols >= 10 {
-                            let to_send: Option<(Uuid, Vec<u8>)> = {
-                                let mut g = subscribed.lock().await;
-                                if let Some(sub) = g.as_mut() {
-                                    if let Some(sess) = state.registry.get(sub.session_id) {
-                                        let mut parser = vt100::Parser::new(rows, cols, 1000);
-                                        let (history, end_cursor) = sess.read_output(0);
-                                        if !history.is_empty() {
-                                            parser.process(&history);
-                                        }
-                                        let fresh = parser.screen().state_formatted();
-                                        let prev = parser.screen().clone();
-                                        sub.parser = parser;
-                                        sub.prev_screen = prev;
-                                        sub.ring_cursor = end_cursor;
-                                        if fresh.is_empty() { None } else { Some((sub.session_id, fresh)) }
-                                    } else { None }
-                                } else { None }
-                            };
-                            if let Some((sid, fresh)) = to_send {
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&fresh);
-                                let msg = json!({
-                                    "kind": "session.output",
-                                    "session_id": sid,
-                                    "data_b64": b64,
-                                }).to_string();
-                                let _ = out_tx.send(msg).await;
+                            let session_id_opt = subscribed.lock().await.as_ref().map(|s| s.session_id);
+                            if let Some(sid) = session_id_opt {
+                                if let Some(sess) = state.registry.get(sid) {
+                                    let bumped = rows.saturating_sub(1).max(4);
+                                    let _ = sess.resize(bumped, cols);
+                                    tokio::time::sleep(Duration::from_millis(30)).await;
+                                    let _ = sess.resize(rows, cols);
+                                    let to_send: Option<(Uuid, Vec<u8>)> = {
+                                        let mut g = subscribed.lock().await;
+                                        if let Some(sub) = g.as_mut() {
+                                            let mut parser = vt100::Parser::new(rows, cols, 1000);
+                                            let (history, end_cursor) = sess.read_output(0);
+                                            if !history.is_empty() {
+                                                parser.process(&history);
+                                            }
+                                            let fresh = parser.screen().state_formatted();
+                                            let prev = parser.screen().clone();
+                                            sub.parser = parser;
+                                            sub.prev_screen = prev;
+                                            sub.ring_cursor = end_cursor;
+                                            if fresh.is_empty() { None } else { Some((sub.session_id, fresh)) }
+                                        } else { None }
+                                    };
+                                    if let Some((sid, fresh)) = to_send {
+                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&fresh);
+                                        let msg = json!({
+                                            "kind": "session.output",
+                                            "session_id": sid,
+                                            "data_b64": b64,
+                                        }).to_string();
+                                        let _ = out_tx.send(msg).await;
+                                    }
+                                }
                             }
                         }
                     }

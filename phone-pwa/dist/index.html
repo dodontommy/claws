@@ -125,7 +125,12 @@
     display: flex; flex-direction: column;
     height: 100dvh; background: var(--bg);
     padding-top: env(safe-area-inset-top);
-    padding-bottom: env(safe-area-inset-bottom);
+    /* Bottom padding includes both the iOS safe-area inset (home bar)
+       AND a `--keyboard-inset` we set in app.js from visualViewport when
+       the soft keyboard is up. The flex column (header + view) shrinks
+       to the keyboard-free area, xterm scrolls to cursor naturally,
+       and the user can see what they're typing. */
+    padding-bottom: calc(env(safe-area-inset-bottom) + var(--keyboard-inset, 0px));
   }
 
   /* ---- Top bar: TUI-style label + status counts + connection ------------ */

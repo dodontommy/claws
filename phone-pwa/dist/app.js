@@ -318,31 +318,42 @@ function attachTerminalTo(mount) {
     // Take xterm's helper textarea out of the focus path — our Ace-style
     // iOS input proxy is the only element that should receive keyboard.
     disableXtermHelperTextarea();
-    // No window/visualViewport resize listener at all. iOS Safari fires
-    // `resize` (not just visualViewport.resize) when the keyboard shows,
-    // so any auto-fit ends up triggering an xterm relayout that steals
-    // focus from the active input and dismisses the keyboard. Initial
-    // fit happens on first attach; that's enough for our purposes.
-    // Rotation will need a manual page reload to re-fit, which is a
-    // worthwhile trade for typing actually working.
+    // Keyboard-aware viewport. When the iOS keyboard appears, visualViewport
+    // shrinks below window.innerHeight; we mirror that as bottom padding on
+    // the body so the .pty-mount (flex:1) shrinks to the visible area and
+    // xterm's scroll-to-cursor keeps your typing in view. Pure layout-side
+    // adjustment — no xterm.fit, no resize message, so iOS focus on the
+    // input proxy isn't disturbed.
+    if (window.visualViewport) {
+      const adjustForKeyboard = () => {
+        const vv = window.visualViewport;
+        const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        document.documentElement.style.setProperty("--keyboard-inset", `${offset}px`);
+      };
+      window.visualViewport.addEventListener("resize", adjustForKeyboard);
+      window.visualViewport.addEventListener("scroll", adjustForKeyboard);
+      adjustForKeyboard();
+    }
   }
-  // Defer fit + subscribe until layout settles. We must subscribe AFTER
-  // fit so the rows/cols we report match what xterm actually renders;
-  // the daemon builds our private parser at exactly that size.
-  requestAnimationFrame(() => {
-    if (fitAddon) {
-      try { fitAddon.fit(); } catch {}
-    }
-    if (state.selectedId && state.ws && state.ws.readyState === 1) {
-      sendWS({
-        kind: "subscribe",
-        session_id: state.selectedId,
-        rows: term.rows,
-        cols: term.cols,
-      });
-    }
-    t.scrollToBottom();
-  });
+  // Defer fit + subscribe until layout settles. xterm's first measure
+  // can return zeros on some devices when called inside a single rAF
+  // after open(); we double-rAF + short delay to be sure dimensions
+  // are real. Subscribe carries our actual rows/cols so the daemon
+  // builds OUR private virtual screen at the right geometry.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    setTimeout(() => {
+      if (fitAddon) { try { fitAddon.fit(); } catch {} }
+      if (state.selectedId && state.ws && state.ws.readyState === 1) {
+        sendWS({
+          kind: "subscribe",
+          session_id: state.selectedId,
+          rows: term.rows || 24,
+          cols: term.cols || 80,
+        });
+      }
+      t.scrollToBottom();
+    }, 50);
+  }));
 }
 
 function detachTerminal() {
