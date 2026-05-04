@@ -5,7 +5,7 @@
 If you find a security issue in claws, please **do not open a public GitHub
 issue**. Instead, email the maintainer:
 
-- **tommybonderenka@gmail.com**
+- **machine.valley@gmail.com**
 
 Or use GitHub's private vulnerability reporting:
 
