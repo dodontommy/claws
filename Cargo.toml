@@ -1,6 +1,6 @@
 [package]
 name = "claws"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "TUI multiplexer for Claude Code sessions"
 repository = "https://github.com/dodontommy/claws"
@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Cross-platform exclusive file locks. Used to guarantee exactly one daemon
+# process at a time — kernel auto-releases the lock if the holder dies for
+# any reason, including SIGKILL. No timeouts, no PID checking, no race window.
+fs4 = "0.8"
 axoupdater = { version = "0.10", features = ["github_releases"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }

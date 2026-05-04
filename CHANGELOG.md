@@ -4,6 +4,33 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.3] — 2026-05-04
+
+### Fixed
+- **Only one daemon can run at a time, ever.** The previous "try-bind, then
+  probe-with-timeout" heuristic failed when an existing daemon was slow to
+  respond (auto_resume processing a long resume queue, busy under load,
+  etc.) — the probe timed out, the new daemon assumed stale, and we ended
+  up with two daemons listening on the same socket path. Each then
+  auto-resumed sessions independently, spawning duplicate `claude --resume`
+  processes that wrote to the same JSONL transcripts and caused silent
+  fork-divergence (e.g., phone and dev TUI viewing the "same" session
+  but talking to different conversations).
+
+  Replaced with a kernel-level `flock` on `state_dir/daemon.lock`. The OS
+  releases the lock automatically when the holder dies for any reason
+  including SIGKILL — no timeouts, no PID-existence checks, no race
+  window. Acquired before any bind / token / pidfile work; if the lock
+  is held, the new daemon exits cleanly without touching anything.
+
+### Added
+- **Orphan claude reaping.** On daemon start, scan `/proc` for
+  `claude --resume <id>` processes whose parent isn't us — leftovers from
+  a SIGKILL'd previous daemon. SIGTERM them before `auto_resume` spawns
+  fresh claudes, with a brief grace period so the orphan transcripts
+  don't race the new ones on JSONL append. Linux-only; macOS/Windows
+  paths are no-ops.
+
 ## [0.3.2] — 2026-05-04
 
 ### Fixed

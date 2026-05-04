@@ -21,38 +21,56 @@ pub async fn run() -> Result<()> {
     let sock = paths::socket_name()?;
     tracing::info!(socket = %sock, "daemon starting");
 
-    // Bind the listener with a "don't clobber a live daemon" protocol:
+    // ── Mutual exclusion ───────────────────────────────────────────────────
+    // Take an exclusive flock on `state_dir/daemon.lock` BEFORE any bind /
+    // token / pidfile work. The kernel releases this lock automatically when
+    // the holder dies — for any reason, including SIGKILL, OOM, or panic.
+    // No timeouts, no PID-existence checks, no race window. If we don't get
+    // the lock, another daemon is alive and we exit cleanly without touching
+    // anything else.
     //
-    //   1. Try to bind directly.
-    //   2. If bind fails because the path is in use, probe by connecting. If
-    //      a daemon answers on the socket, log and exit cleanly — never
-    //      remove the file or write a new auth token, so the live daemon
-    //      stays untouched.
-    //   3. If the connect fails (ECONNREFUSED/ENOENT), the file is stale
-    //      from a crashed daemon; remove it and retry the bind once.
-    //
-    // The previous code unconditionally `remove_file`d before binding, which
-    // let two daemons race-bind to the same path: D2's remove_file deleted
-    // D1's socket entry, D2's bind created a fresh inode at the same path,
-    // and now both processes were "the daemon" — duplicating `claude --resume`
-    // children for every persisted session and bricking active sessions.
-    let listener = match try_bind(&sock).await {
-        Ok(l) => l,
-        Err(_first_err) => {
-            if probe_existing_daemon(&sock).await {
+    // Replaces the earlier "try-bind, then probe-with-timeout" heuristic,
+    // which let zombie daemons proliferate when the existing daemon was slow
+    // to respond to the probe within 500ms. v0.3.3 closes that class of bug
+    // for good.
+    let lock_path = paths::state_dir()?.join("daemon.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open lock file {}", lock_path.display()))?;
+    {
+        use fs4::FileExt;
+        // try_lock_exclusive returns Err with kind WouldBlock when another
+        // process holds the lock. Anything else (got it, or an unexpected
+        // error like permission denied) is fatal-or-fine: we proceed only
+        // if we own the lock.
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {} // got it
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 tracing::info!(
-                    socket = %sock,
-                    "another daemon is already listening; exiting cleanly so we don't \
-                     clobber its socket and spawn duplicate claude --resume children"
+                    lock = %lock_path.display(),
+                    "another daemon is already running — exiting cleanly"
                 );
                 return Ok(());
             }
-            tracing::warn!(socket = %sock, "stale socket file from a crashed daemon — removing");
-            #[cfg(unix)]
-            let _ = std::fs::remove_file(&sock);
-            try_bind(&sock).await.context("retry bind after removing stale socket")?
+            Err(e) => {
+                anyhow::bail!("acquire daemon lock {}: {e}", lock_path.display());
+            }
         }
-    };
+    }
+    // `lock_file` MUST stay alive for the daemon's whole lifetime. Holding
+    // it past the end of `run` is the lock. The variable is used at the
+    // bottom of the function (drop) so the borrow checker keeps it.
+
+    // ── Socket bind ────────────────────────────────────────────────────────
+    // With flock guaranteeing we're the only daemon, the only reason for a
+    // pre-existing socket file is a previous daemon that crashed. Remove it
+    // unconditionally and bind fresh.
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&sock);
+    let listener = try_bind(&sock).await.context("bind socket after lock acquired")?;
 
     let auth_token = Arc::new(crate::auth::write_new_token().context("write auth token")?);
     tracing::info!("auth token written");
@@ -64,6 +82,14 @@ pub async fn run() -> Result<()> {
     let shutdown = Arc::new(Notify::new());
     let registry = SessionRegistry::new();
     let store = Store::open()?;
+
+    // Belt-and-suspenders: kill any orphaned `claude --resume <id>` processes
+    // from a previous daemon's lifetime before we spawn fresh ones in
+    // auto_resume. flock prevents two daemons from coexisting going forward,
+    // but if the *previous* daemon was SIGKILL'd we may inherit its child
+    // claudes. Keeping them alongside the freshly-resumed claudes would
+    // produce two writers per JSONL transcript and silent fork-divergence.
+    reap_orphan_claudes();
 
     auto_resume(&store, &registry).await;
 
@@ -128,6 +154,78 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Walk /proc, find any `claude --resume <id>` whose parent isn't us, kill
+/// them with SIGTERM. These are leftovers from a daemon that died without
+/// reaping its children — flock makes "two daemons coexist" impossible
+/// going forward, but a SIGKILL'd previous daemon can leak its claudes.
+/// Linux-only; macOS daemon hosts are not a current target.
+#[cfg(target_os = "linux")]
+fn reap_orphan_claudes() {
+    let our_pid = std::process::id();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut killed = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == our_pid {
+            continue;
+        }
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let cmd = String::from_utf8_lossy(&cmdline);
+        if !cmd.contains("claude") || !cmd.contains("--resume") {
+            continue;
+        }
+        // /proc/<pid>/stat: "pid (comm) state ppid ..."  — comm can contain
+        // parens, so anchor on the *last* ')' to find the field boundary.
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let after_comm = match stat.rfind(')') {
+            Some(i) => &stat[i + 1..],
+            None => continue,
+        };
+        let parts: Vec<&str> = after_comm.split_whitespace().collect();
+        let ppid: i32 = match parts.get(1).and_then(|p| p.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if ppid as u32 == our_pid {
+            continue; // already a child of this daemon
+        }
+        tracing::warn!(pid, ppid, "killing orphan claude --resume from a previous daemon");
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        killed += 1;
+    }
+    if killed > 0 {
+        // Brief grace so SIGTERM lands before auto_resume starts new claudes
+        // — otherwise we race the orphans on JSONL append.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tracing::info!(count = killed, "reaped orphan claudes from previous daemon");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_orphan_claudes() {
+    // macOS / Windows path: no /proc-equivalent we want to depend on. The
+    // flock alone is sufficient for the common cases on this platform.
+}
+
 async fn try_bind(
     sock: &str,
 ) -> Result<interprocess::local_socket::tokio::Listener> {
@@ -139,22 +237,6 @@ async fn try_bind(
         .name(name)
         .create_tokio()
         .context("bind socket")
-}
-
-/// Connect to the socket. If the connect succeeds within a short timeout,
-/// some process is accepting on it — treat as "live daemon" and back off.
-/// If connect fails (no listener / file gone), it's our turn to bind.
-async fn probe_existing_daemon(sock: &str) -> bool {
-    let name = match sock.to_string().to_fs_name::<GenericFilePath>() {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    let connect = interprocess::local_socket::tokio::Stream::connect(name);
-    match tokio::time::timeout(std::time::Duration::from_millis(500), connect).await {
-        Ok(Ok(_stream)) => true,
-        // ConnectionRefused / NotFound / timeout → no live daemon.
-        _ => false,
-    }
 }
 
 async fn auto_resume(store: &Store, reg: &SessionRegistry) {
