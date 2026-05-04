@@ -546,6 +546,18 @@ impl Session {
                 if matches!(s.status, SessionStatus::Spawning) {
                     s.status = SessionStatus::Idle;
                 }
+                // /clear and /compact reset Claude's conversation window but
+                // reuse the same PTY and JSONL. The latest-turn token counts
+                // and any NN% cells lingering on the vt100 screen would
+                // otherwise pin the context bar to its pre-clear value
+                // forever (scraped wins over the computed fallback).
+                let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                if source == "clear" || source == "compact" {
+                    s.latest_input_tokens = 0;
+                    s.latest_cache_read_input_tokens = 0;
+                    let (rows, cols) = s.parser.screen().size();
+                    s.parser = vt100::Parser::new(rows, cols, 0);
+                }
             }
             "UserPromptSubmit" => {
                 s.status = SessionStatus::Streaming;
