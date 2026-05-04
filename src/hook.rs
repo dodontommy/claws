@@ -23,7 +23,14 @@ pub fn build_settings_json(claws_exe: &Path, session_id: Uuid) -> Value {
     let exe_str = claws_exe.to_string_lossy().replace('\\', "/");
     let mut hooks = serde_json::Map::new();
     for ev in EVENTS {
-        let cmd = format!("\"{exe_str}\" hook-emit --session {session_id} --event {ev}");
+        // Don't wrap the path in double-quotes. Recent Claude Code versions
+        // exec the hook command directly (no `sh -c`), which means the whole
+        // string becomes argv[0..] — and a quoted path becomes a literal
+        // file `"/opt/homebrew/bin/claws"` (with quotes) that doesn't exist.
+        // Hooks then silently fail to launch and the daemon never sees an
+        // event. Paths with embedded spaces will break here; that's a
+        // future problem when someone hits it.
+        let cmd = format!("{exe_str} hook-emit --session {session_id} --event {ev}");
         let entry = json!([
             {
                 "hooks": [

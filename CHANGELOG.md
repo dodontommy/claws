@@ -4,6 +4,26 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.4] — 2026-05-04
+
+### Fixed
+- **Hooks silently failed to fire on macOS**, leaving the dashboard fully
+  static — sidebar titles never updated, detail pane stayed empty,
+  `current_tool` / `last_message` / `ai_title` never populated. Cause:
+  the hook command we wrote into per-session settings.json wrapped the
+  claws executable path in double quotes (originally to defend against
+  Windows paths with spaces). Recent Claude Code versions exec the hook
+  command directly instead of via `sh -c`, so the entire string becomes
+  argv — argv[0] became the literal `"/opt/homebrew/bin/claws"` (with
+  quotes), which doesn't exist as a file on disk, hooks never launched,
+  daemon never received events. Linux still worked because `sh -c` was
+  apparently still in use there. Dropped the outer quotes.
+
+  Paths with embedded spaces are now technically a problem (rare on
+  Unix; the canonical claws install paths `~/.cargo/bin/`,
+  `/opt/homebrew/bin/`, `/usr/local/bin/` are all space-free). If
+  someone hits it we'll switch to the array form of the hook command.
+
 ## [0.3.3] — 2026-05-04
 
 ### Fixed
