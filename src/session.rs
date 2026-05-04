@@ -11,8 +11,12 @@ use uuid::Uuid;
 pub enum SpawnMode {
     /// New conversation: pass `--session-id <uuid>` to claude.
     Fresh,
-    /// Resume an existing transcript: pass `--resume <uuid>` to claude.
-    Resume,
+    /// Resume an existing transcript: pass `--resume <resume_id>` to claude.
+    /// `resume_id` may differ from the session's registry id when claude has
+    /// forked the underlying transcript (via `/clear` etc) — the registry
+    /// id is the user-visible identity, `resume_id` is what we hand to
+    /// `claude --resume`.
+    Resume { resume_id: Uuid },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +57,11 @@ pub struct Session {
     pub extra_args: Vec<String>,
     state: Arc<Mutex<SessionRuntime>>,
     display_override: Mutex<Option<String>>,
+    /// When claude has forked the session UUID under us (e.g. via /clear),
+    /// this is the *current* id claude is writing transcripts under. None
+    /// means "same as `id`". Updated when a hook payload arrives bearing a
+    /// session_id different from what we expect.
+    actual_id: Mutex<Option<Uuid>>,
 }
 
 pub struct SessionSnapshot {
@@ -136,9 +145,9 @@ pub fn spawn_session(
             cmd.arg("--session-id");
             cmd.arg(id.to_string());
         }
-        SpawnMode::Resume => {
+        SpawnMode::Resume { resume_id } => {
             cmd.arg("--resume");
-            cmd.arg(id.to_string());
+            cmd.arg(resume_id.to_string());
         }
     }
     if let Some(m) = &model {
@@ -209,6 +218,7 @@ pub fn spawn_session(
         extra_args,
         state: runtime,
         display_override: Mutex::new(None),
+        actual_id: Mutex::new(None),
     })
 }
 
@@ -481,6 +491,14 @@ impl Session {
 
     pub fn set_display_override(&self, name: Option<String>) {
         *self.display_override.lock().unwrap() = name;
+    }
+
+    pub fn actual_id(&self) -> Option<Uuid> {
+        *self.actual_id.lock().unwrap()
+    }
+
+    pub fn set_actual_id(&self, id: Option<Uuid>) {
+        *self.actual_id.lock().unwrap() = id;
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {

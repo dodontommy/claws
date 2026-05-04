@@ -4,6 +4,26 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.6] — 2026-05-04
+
+### Fixed
+- **`/clear` no longer strands your conversation in a forked transcript.**
+  Claude Code creates a new session UUID on `/clear` (and similar context
+  resets), but claws was still tracking the original UUID — so the next
+  daemon restart would `claude --resume <old-id>` and quietly leave all
+  the post-`/clear` work orphaned in a separate JSONL.
+
+  Detection now happens automatically. Hook events from claude carry
+  the *current* session id in their payload; when that diverges from
+  what we registered, we record the new id as `actual_id` on the
+  persisted row. On the next restart, auto-resume passes `actual_id`
+  to `claude --resume` instead of the original spawn id, so the
+  conversation continues without manual SQLite swaps. The user-visible
+  registry id stays put — fork tracking is internal.
+
+  Schema: new nullable `actual_id` column on `sessions`. Idempotent
+  ALTER on open; existing DBs upgrade transparently.
+
 ## [0.3.5] — 2026-05-04
 
 ### Fixed

@@ -280,8 +280,19 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
         let name = Some(ps.name.clone());
         let model = ps.model.clone();
         let extra_args = ps.extra_args.clone();
+        // If claude forked the session id under us last time (recorded in
+        // actual_id), resume that — otherwise the registry-side id.
+        let resume_id = ps.actual_id.unwrap_or(ps.id);
         let result = tokio::task::spawn_blocking(move || {
-            spawn_session(id, cwd, name, model, settings_path, SpawnMode::Resume, extra_args)
+            spawn_session(
+                id,
+                cwd,
+                name,
+                model,
+                settings_path,
+                SpawnMode::Resume { resume_id },
+                extra_args,
+            )
         })
         .await;
         match result {
@@ -289,6 +300,9 @@ async fn auto_resume(store: &Store, reg: &SessionRegistry) {
                 if let Some(name) = ps.display_override.clone() {
                     s.set_display_override(Some(name));
                 }
+                // Seed the in-memory actual_id from disk so the fork
+                // detector compares hooks against the right baseline.
+                s.set_actual_id(ps.actual_id);
                 tracing::info!(id = %s.id, cwd = %s.cwd.display(), "resumed");
                 reg.insert(s);
             }
@@ -403,7 +417,7 @@ async fn dispatch(
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
         "hook_event" => match serde_json::from_value::<HookEventParams>(req.params.clone()) {
-            Ok(p) => handle_hook_event(req.id, p, registry).await,
+            Ok(p) => handle_hook_event(req.id, p, registry, store).await,
             Err(e) => err(req.id, RpcError::invalid_params(e.to_string())),
         },
         "resize_session" => match serde_json::from_value::<ResizeParams>(req.params.clone()) {
@@ -801,6 +815,7 @@ async fn handle_restart(
     let name = old.name.clone();
     let model = old.model_requested.clone();
     let display_override = old.display_override();
+    let preserved_actual_id = old.actual_id();
     // We need to re-load extra_args from the store (the live Session doesn't
     // remember them — they're only used at spawn). Easier: just resume with no
     // extra args. If the user wanted them, they're in the persisted row.
@@ -823,8 +838,17 @@ async fn handle_restart(
         }
     };
     let session_id = p.session_id;
+    let resume_id = preserved_actual_id.unwrap_or(session_id);
     let result = tokio::task::spawn_blocking(move || {
-        spawn_session(session_id, cwd, Some(name), model, settings_path, SpawnMode::Resume, extra_args)
+        spawn_session(
+            session_id,
+            cwd,
+            Some(name),
+            model,
+            settings_path,
+            SpawnMode::Resume { resume_id },
+            extra_args,
+        )
     })
     .await;
     match result {
@@ -832,6 +856,7 @@ async fn handle_restart(
             if let Some(name) = display_override {
                 s.set_display_override(Some(name));
             }
+            s.set_actual_id(preserved_actual_id);
             reg.insert(s);
             ok(id, json!({"restarted": true}))
         }
@@ -850,10 +875,40 @@ async fn handle_resize(id: u64, p: ResizeParams, reg: &SessionRegistry) -> Respo
     }
 }
 
-async fn handle_hook_event(id: u64, p: HookEventParams, reg: &SessionRegistry) -> Response {
+async fn handle_hook_event(
+    id: u64,
+    p: HookEventParams,
+    reg: &SessionRegistry,
+    store: &Store,
+) -> Response {
     match reg.get(p.session_id) {
         Some(s) => {
             tracing::debug!(session_id = %p.session_id, event = %p.event, "hook event");
+            // Fork detection: claude includes its CURRENT session_id in the
+            // hook payload. When that diverges from what we registered (or
+            // last recorded as actual_id), claude has switched transcripts
+            // under us — typically via /clear. Record the new id so the
+            // next daemon startup resumes the right transcript.
+            let payload_sid = p
+                .payload
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            if let Some(new_sid) = payload_sid {
+                let effective = s.actual_id().unwrap_or(s.id);
+                if new_sid != effective {
+                    tracing::info!(
+                        registry_id = %s.id,
+                        old_actual = %effective,
+                        new_actual = %new_sid,
+                        "claude session id forked (likely /clear); updating actual_id"
+                    );
+                    s.set_actual_id(Some(new_sid));
+                    if let Err(e) = store.set_actual_id(s.id, Some(new_sid)) {
+                        tracing::warn!(error = %e, "failed to persist new actual_id");
+                    }
+                }
+            }
             s.on_hook_event(&p.event, &p.payload);
             ok(id, json!("ok"))
         }

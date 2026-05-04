@@ -18,6 +18,11 @@ pub struct PersistedSession {
     pub model: Option<String>,
     pub extra_args: Vec<String>,
     pub display_override: Option<String>,
+    /// When claude has forked the session UUID (e.g. via `/clear`), this
+    /// holds the new id we should pass to `claude --resume` on next
+    /// startup. None = same as `id`. Updated automatically when a hook
+    /// payload arrives with a different `session_id` than we registered.
+    pub actual_id: Option<Uuid>,
 }
 
 impl Store {
@@ -47,6 +52,7 @@ impl Store {
         // Idempotent migrations.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN extra_args TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN display_override TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN actual_id TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -90,10 +96,24 @@ impl Store {
         Ok(())
     }
 
+    /// Record that claude has forked the underlying session UUID — set
+    /// `actual` to the new id, or None to clear (back to `id`). On the
+    /// next daemon startup, auto-resume passes `actual_id` (when present)
+    /// to `claude --resume` instead of the original spawn id, so we
+    /// follow the new transcript without churning the registry-side id.
+    pub fn set_actual_id(&self, id: Uuid, actual: Option<Uuid>) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE sessions SET actual_id = ?1 WHERE id = ?2",
+            params![actual.map(|u| u.to_string()), id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_resumable(&self) -> Result<Vec<PersistedSession>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT id, cwd, name, model, started_at_ms, extra_args, display_override FROM sessions
+            "SELECT id, cwd, name, model, started_at_ms, extra_args, display_override, actual_id FROM sessions
              WHERE closed_by_user = 0
              ORDER BY started_at_ms ASC",
         )?;
@@ -112,6 +132,11 @@ impl Store {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
             let display_override: Option<String> = row.get(6).ok();
+            let actual_id: Option<Uuid> = row
+                .get::<_, Option<String>>(7)
+                .ok()
+                .flatten()
+                .and_then(|s| Uuid::parse_str(&s).ok());
             // started_at_ms (col 4) is selected for the ORDER BY to be cheap;
             // we don't surface it on PersistedSession because nothing downstream
             // uses it — Session::started_at is reset on resume.
@@ -123,6 +148,7 @@ impl Store {
                 model: row.get(3)?,
                 extra_args,
                 display_override,
+                actual_id,
             })
         })?;
         let mut out = Vec::new();
