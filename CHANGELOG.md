@@ -4,6 +4,21 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.1] — 2026-05-04
+
+### Fixed
+
+- **Context bar stuck after `/clear` or `/compact`.** SessionStart fires with
+  `source=clear|compact` when Claude resets its conversation in-place; we
+  weren't acting on it, so the latest-turn token counts (computed-fallback)
+  and any `NN%` cells lingering on the vt100 screen (scraped path) pinned
+  the bar to its pre-clear value forever. Both surfaces now reset on that
+  signal.
+- **Windows build (CI + release).** `web-push 0.10`'s `hyper-client` feature
+  transitively pulls `openssl-sys` (via `hyper-tls` and `ece`), which broke
+  on the Windows GHA runner since no system OpenSSL is on PATH. Vendor
+  openssl on Windows only; Unix builds keep using the system library.
+
 ## [0.3.0] — 2026-05-03
 
 ### Added — phone companion (PWA)
