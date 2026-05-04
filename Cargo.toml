@@ -48,7 +48,9 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 mime_guess = "2"
 qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
-# Web Push (VAPID + aes128gcm). hyper-client uses rustls — no OpenSSL pull-in.
+# Web Push (VAPID + aes128gcm). hyper-client transitively pulls native-tls
+# (hyper-tls) and openssl (ece). On Windows we vendor openssl-sys below so
+# CI doesn't need a system OpenSSL on PATH.
 web-push = { version = "0.10", default-features = false, features = ["hyper-client"] }
 # Direct dep for VAPID keypair generation. Matches web-push's transitive
 # version so we share one copy.
@@ -56,6 +58,12 @@ jwt-simple = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Force web-push's transitive openssl-sys to vendor on Windows so CI doesn't
+# need a preinstalled OpenSSL. Strawberry Perl on the GHA runner is enough
+# to build it from source.
+[target.'cfg(windows)'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [profile.dev]
 opt-level = 0
