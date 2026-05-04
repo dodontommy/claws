@@ -332,20 +332,21 @@ function attachTerminalTo(mount) {
     // input proxy isn't disturbed.
     if (window.visualViewport) {
       // Only listen to `resize` — keyboard show/hide is the resize event
-      // we care about. `scroll` fires continuously while iOS Safari's URL
-      // bar collapses/expands on touch-scroll, and updating the inset on
-      // each one made the layout jitter visibly. Threshold tiny deltas
-      // (URL-bar shimmies) so we only react to real keyboard transitions.
-      let lastInset = 0;
-      const adjustForKeyboard = () => {
-        const vv = window.visualViewport;
-        const inset = Math.max(0, window.innerHeight - vv.height);
-        if (Math.abs(inset - lastInset) < 50) return;
-        lastInset = inset;
-        document.documentElement.style.setProperty("--keyboard-inset", `${inset}px`);
+      // Drive the app's height from visualViewport.height directly so
+      // when the iOS keyboard appears (and visualViewport.height shrinks),
+      // the .app box shrinks to match — chips/input land in the visible
+      // area, xterm scrolls to keep the cursor in view. 50px threshold
+      // ensures URL-bar collapse/expand (small px shimmies) doesn't
+      // trigger a relayout, which is what was bouncing the terminal.
+      let lastVh = 0;
+      const setAppH = () => {
+        const vh = window.visualViewport.height;
+        if (Math.abs(vh - lastVh) < 50) return;
+        lastVh = vh;
+        document.documentElement.style.setProperty("--app-h", `${vh}px`);
       };
-      window.visualViewport.addEventListener("resize", adjustForKeyboard);
-      adjustForKeyboard();
+      window.visualViewport.addEventListener("resize", setAppH);
+      setAppH();
     }
   }
   // Defer fit + subscribe until layout settles. xterm's first measure

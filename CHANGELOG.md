@@ -4,6 +4,19 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.5] — 2026-05-04
+
+### Fixed
+- **Phone keyboard overlays the terminal again.** v0.3.0 had keyboard
+  push behaviour working via `100dvh`, which iOS Safari shrinks
+  automatically when the keyboard appears. v0.3.0's "stop the bouncing"
+  pass switched to `100svh` (which doesn't shrink — fixes URL-bar
+  shimmies but breaks keyboard accommodation). Replaced with a
+  JS-driven `--app-h` set from `window.visualViewport.height` directly,
+  which DOES shrink with the keyboard, with a 50px change threshold
+  to keep URL-bar shimmies from triggering relayouts. Best of both:
+  app shrinks when keyboard pops, doesn't bounce on URL-bar movement.
+
 ## [0.3.4] — 2026-05-04
 
 ### Fixed

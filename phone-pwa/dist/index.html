@@ -126,14 +126,15 @@
   ::selection { background: var(--accent); color: var(--bg); }
   .app {
     display: flex; flex-direction: column;
-    height: 100svh; background: var(--bg);
+    /* --app-h is set in app.js from window.visualViewport.height with a
+       50px change threshold — so the box shrinks when the iOS keyboard
+       appears (chips + input land in the visible area, xterm scrolls
+       to cursor) but doesn't bounce on URL-bar shimmies. svh is the
+       fallback before JS runs. */
+    height: var(--app-h, 100svh);
+    background: var(--bg);
     padding-top: env(safe-area-inset-top);
-    /* Bottom padding includes both the iOS safe-area inset (home bar)
-       AND a `--keyboard-inset` we set in app.js from visualViewport when
-       the soft keyboard is up. The flex column (header + view) shrinks
-       to the keyboard-free area, xterm scrolls to cursor naturally,
-       and the user can see what they're typing. */
-    padding-bottom: calc(env(safe-area-inset-bottom) + var(--keyboard-inset, 0px));
+    padding-bottom: env(safe-area-inset-bottom);
   }
 
   /* ---- Top bar: TUI-style label + status counts + connection ------------ */
