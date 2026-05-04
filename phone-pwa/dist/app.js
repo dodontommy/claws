@@ -46,6 +46,12 @@ const state = {
   // Per-session permission-request payloads. Cleared when status leaves
   // awaiting_permission. Keyed by session_id.
   permissionRequests: {},
+  // What's currently mounted in `#app`. Snapshot-driven render() calls
+  // dispatch to in-place update*() functions when this matches the desired
+  // view, so the DOM (and focused input / xterm) survives. Only a real
+  // view change pays the replaceWith cost.
+  mountedView: null, // "pair" | "list" | "detail"
+  mountedDetailId: null,
 };
 
 // Persistent xterm.js Terminal. Lives outside the rerender cycle because
@@ -604,12 +610,177 @@ function urlB64ToUint8Array(b64) {
 // ---- Views ------------------------------------------------------------------
 
 function render() {
-  if (!state.token) { detachTerminal(); renderPair(); return; }
-  if (state.view === "detail" && state.selectedId) {
-    renderDetail();
+  if (!state.token) {
+    if (state.mountedView !== "pair") {
+      detachTerminal();
+      renderPair();
+      state.mountedView = "pair";
+      state.mountedDetailId = null;
+    } else {
+      updatePair();
+    }
+    return;
+  }
+  const desired = state.view === "detail" && state.selectedId ? "detail" : "list";
+  if (desired === "list") {
+    if (state.mountedView !== "list") {
+      detachTerminal();
+      renderList();
+      state.mountedView = "list";
+      state.mountedDetailId = null;
+    } else {
+      updateList();
+    }
   } else {
-    detachTerminal();
-    renderList();
+    // Detail view — full re-render only on first entry or when the
+    // selected session changes. Snapshot ticks for the SAME session
+    // route to updateDetail() so xterm stays attached (no re-subscribe,
+    // no flicker).
+    if (state.mountedView !== "detail" || state.mountedDetailId !== state.selectedId) {
+      detachTerminal();
+      renderDetail();
+      state.mountedView = "detail";
+      state.mountedDetailId = state.selectedId;
+    } else {
+      updateDetail();
+    }
+  }
+}
+
+function updatePair() {
+  // Pairing screen has only one piece of state-driven content (the error
+  // text); the input already lives in the DOM and we never want to clobber
+  // it mid-typing.
+  const root = document.getElementById("app");
+  if (!root) { state.mountedView = null; return render(); }
+  const pair = root.querySelector(".pair");
+  if (!pair) return;
+  let err = pair.querySelector(".err");
+  if (state.pairError) {
+    if (!err) {
+      err = document.createElement("div");
+      err.className = "err";
+      pair.appendChild(err);
+    }
+    err.textContent = state.pairError;
+  } else if (err) {
+    err.remove();
+  }
+}
+
+function updateList() {
+  const root = document.getElementById("app");
+  if (!root) { state.mountedView = null; return render(); }
+
+  // Counts.
+  const counts = { streaming: 0, awaiting_permission: 0, idle: 0, exited: 0 };
+  for (const s of state.sessions) {
+    if (counts[s.status] !== undefined) counts[s.status]++;
+  }
+  const countsEl = root.querySelector(".counts");
+  if (countsEl) {
+    countsEl.innerHTML = `
+      ${counts.streaming ? `<span class="c working"><span class="glyph">●</span> ${counts.streaming}</span>` : ""}
+      ${counts.awaiting_permission ? `<span class="c awaiting"><span class="glyph">★</span> ${counts.awaiting_permission}</span>` : ""}
+      ${counts.idle ? `<span class="c idle"><span class="glyph">◐</span> ${counts.idle}</span>` : ""}
+    `;
+  }
+
+  // Connection chip.
+  const conn = root.querySelector(".conn");
+  if (conn) {
+    conn.className = `conn ${state.wsAlive ? "live" : "gone"}`;
+    conn.textContent = state.wsAlive ? "live" : "offline";
+  }
+
+  // Session rows. No focusable elements live inside rows, so it's safe to
+  // rebuild innerHTML on each tick.
+  const list = root.querySelector(".list");
+  if (list) {
+    const rows = state.sessions.map((s) => `
+      <div class="row ${escapeHtml(s.status)}" data-id="${escapeHtml(s.id)}">
+        <div class="marker"><span class="glyph">${statusGlyph(s.status)}</span></div>
+        <div class="meta">
+          <div class="name">${escapeHtml(displayName(s))}${s.dangerous ? '<span class="danger">!</span>' : ""}</div>
+          <div class="sub">${escapeHtml(s.cwd)}</div>
+        </div>
+        <div class="state">${escapeHtml(stateLabel(s))}</div>
+      </div>
+    `).join("");
+    const empty = state.sessions.length ? "" : `<div class="empty"><pre>╭───────────╮
+│  no       │
+│  sessions │
+╰───────────╯</pre>tap <strong>+</strong> to spawn one</div>`;
+    list.innerHTML = rows + empty;
+    list.querySelectorAll(".row").forEach((r) => {
+      r.addEventListener("click", () => openSession(r.dataset.id));
+    });
+  }
+
+  // Sheet open/close. We deliberately do NOT touch a sheet that's already
+  // mounted — its <input> may be focused and rebuilding it would dismiss
+  // the iOS keyboard.
+  const existingSheet = root.querySelector(".sheet-backdrop");
+  if (state.spawnOpen && !existingSheet) {
+    renderSpawnSheet(root);
+  } else if (state.themeOpen && !existingSheet) {
+    renderThemeSheet(root);
+  } else if (!state.spawnOpen && !state.themeOpen && existingSheet) {
+    existingSheet.remove();
+  }
+}
+
+function updateDetail() {
+  const root = document.getElementById("app");
+  if (!root) { state.mountedView = null; return render(); }
+  const s = state.sessions.find((x) => x.id === state.selectedId);
+  if (!s) {
+    state.view = "list";
+    state.mountedView = null;
+    state.mountedDetailId = null;
+    render();
+    return;
+  }
+
+  // Detail bar: name + status tag.
+  const nameEl = root.querySelector(".detail-bar .name");
+  if (nameEl) {
+    nameEl.innerHTML = `
+      ${escapeHtml(displayName(s))}
+      <span class="sep">·</span>
+      <span class="state-tag ${escapeHtml(s.status)}">${escapeHtml(stateLabel(s))}</span>
+    `;
+  }
+
+  // Permission prompt banner — toggle in place. Don't recreate it if it's
+  // already there with the same shape, to avoid layout jitter.
+  const pr = state.permissionRequests[s.id];
+  const isAwaiting = s.status === "awaiting_permission" || pr;
+  const view = root.querySelector(".view");
+  let banner = view ? view.querySelector(".prompt-banner") : null;
+  if (isAwaiting && view) {
+    const bannerHtml = `
+      <div class="prompt-title">⚠ needs you${pr && pr.tool_name ? ` · <span class="tool">${escapeHtml(pr.tool_name)}</span>` : ""}</div>
+      <div class="prompt-actions">
+        <button class="prompt-btn allow" data-keys="1\\r">1 · Yes</button>
+        <button class="prompt-btn allow-all" data-keys="2\\r">2 · Yes, always</button>
+        <button class="prompt-btn deny" data-keys="3\\r">3 · No</button>
+      </div>
+    `;
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.className = "prompt-banner";
+      view.insertBefore(banner, view.firstChild);
+    }
+    if (banner.dataset.shape !== bannerHtml) {
+      banner.innerHTML = bannerHtml;
+      banner.dataset.shape = bannerHtml;
+      banner.querySelectorAll(".prompt-btn").forEach((b) => {
+        b.addEventListener("click", () => sendKeys(decodeKeys(b.dataset.keys)));
+      });
+    }
+  } else if (!isAwaiting && banner) {
+    banner.remove();
   }
 }
 
@@ -818,20 +989,56 @@ function renderSpawnSheet(root) {
   sheet.addEventListener("click", (e) => { if (e.target === sheet) closeSpawnSheet(); });
   sheet.querySelector("#sf-cancel").addEventListener("click", closeSpawnSheet);
   sheet.querySelectorAll(".model-pill").forEach((p) => {
-    p.addEventListener("click", () => { f.model = p.dataset.m; render(); });
+    // Mutate the .selected class in place rather than calling render() —
+    // a render() while the sheet's input has iOS focus would route through
+    // updateList(), which by design leaves the sheet alone, and we'd
+    // miss the visual update.
+    p.addEventListener("click", () => {
+      f.model = p.dataset.m;
+      sheet.querySelectorAll(".model-pill").forEach((q) => {
+        q.classList.toggle("selected", q.dataset.m === f.model);
+      });
+    });
   });
   sheet.querySelector("#sf-cwd").addEventListener("input", (e) => { f.cwd = e.target.value; });
   sheet.querySelector("#sf-flags").addEventListener("input", (e) => { f.flags = e.target.value; });
-  sheet.querySelector("#sf-submit").addEventListener("click", () => submitSpawn());
+  sheet.querySelector("#sf-submit").addEventListener("click", () => submitSpawn(sheet));
 }
 
-async function submitSpawn() {
+async function submitSpawn(sheet) {
   const f = state.spawnForm;
   if (!f || f.submitting) return;
-  if (!f.cwd.trim()) { f.error = "directory required"; render(); return; }
+  // Mutate the existing sheet DOM directly instead of going through
+  // render(); the sheet may hold an iOS-focused input and a re-render
+  // would dismiss the keyboard.
+  const errEl = () => sheet ? sheet.querySelector(".sheet-err") : null;
+  const setError = (msg) => {
+    if (!sheet) return;
+    let e = errEl();
+    if (!e) {
+      e = document.createElement("div");
+      e.className = "sheet-err";
+      const actions = sheet.querySelector(".sheet-actions");
+      if (actions) sheet.querySelector(".sheet").insertBefore(e, actions);
+      else sheet.querySelector(".sheet").appendChild(e);
+    }
+    e.textContent = msg;
+  };
+  const clearError = () => { const e = errEl(); if (e) e.remove(); };
+  const setSubmitting = (val) => {
+    if (!sheet) return;
+    const btn = sheet.querySelector("#sf-submit");
+    if (btn) {
+      btn.disabled = val;
+      btn.textContent = val ? "spawning…" : "spawn";
+    }
+  };
+
+  if (!f.cwd.trim()) { f.error = "directory required"; setError(f.error); return; }
   f.submitting = true;
   f.error = null;
-  render();
+  clearError();
+  setSubmitting(true);
   // Naive flag split — same shell-words behavior would need a JS parser.
   // A space-split is sufficient for the simple cases the user is likely
   // to type on a phone; complex quoted args belong on the desktop.
@@ -859,7 +1066,8 @@ async function submitSpawn() {
   } catch (e) {
     f.error = String(e.message || e);
     f.submitting = false;
-    render();
+    setError(f.error);
+    setSubmitting(false);
   }
 }
 

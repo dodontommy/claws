@@ -333,6 +333,22 @@ async fn run_update() -> Result<()> {
     use axoupdater::AxoUpdater;
     let mut updater = AxoUpdater::new_for("claws");
     if let Err(e) = updater.load_receipt() {
+        // Homebrew installs land under a `Cellar` directory and don't write
+        // the dist install receipt axoupdater needs. Detect that case so we
+        // can point the user at `brew upgrade` instead of falsely claiming
+        // they used `cargo install`.
+        let exe = std::env::current_exe().ok();
+        let is_brew = exe
+            .as_deref()
+            .map(|p| p.components().any(|c| c.as_os_str() == "Cellar"))
+            .unwrap_or(false);
+        if is_brew {
+            anyhow::bail!(
+                "claws was installed via Homebrew — `claws update` only works for the \
+                 shell/powershell installers. Run:\n  \
+                   brew update && brew upgrade dodontommy/tap/claws"
+            );
+        }
         anyhow::bail!(
             "install receipt missing — `claws` was probably installed via `cargo install` \
              rather than the official installer.\n\n\

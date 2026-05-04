@@ -4,6 +4,24 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.2] — 2026-05-04
+
+### Fixed
+
+- **Phone PWA: spawn-dialog keyboard dismissed on every WS tick, terminal
+  bounced.** Both came from the same root cause — every snapshot called
+  `render()`, which did `replaceWith` on `#app`. That destroyed the focused
+  `<input>` (iOS dropped the keyboard) and re-mounted xterm (which fired
+  a fresh `subscribe`, retransmitting the whole screen — visible bounce).
+  Snapshot-driven re-renders now route through in-place `updateList()` /
+  `updateDetail()` paths; full DOM rebuild only happens when the view
+  *kind* changes. Sheet content is mutated locally so model-pill picks
+  and submit-state changes don't tear down the input.
+- **`claws update` under Homebrew.** axoupdater's "install receipt missing"
+  diagnostic falsely claimed the binary was installed via `cargo install`.
+  Detect a Cellar path in `current_exe` and point the user at
+  `brew upgrade dodontommy/tap/claws` instead.
+
 ## [0.3.1] — 2026-05-04
 
 ### Fixed
