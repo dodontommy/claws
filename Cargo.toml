@@ -1,16 +1,19 @@
 [package]
-name = "claws"
-version = "0.3.6"
+name = "claws-tui"
+version = "0.4.0"
 edition = "2021"
 description = "TUI multiplexer for Claude Code sessions"
-repository = "https://github.com/dodontommy/claws"
-homepage = "https://github.com/dodontommy/claws"
+repository = "https://github.com/dodontommy/claws-tui"
+homepage = "https://github.com/dodontommy/claws-tui"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [package.metadata.dist]
 dist = true
 
+# Crate published as `claws-tui` (the existing `claws` slot on crates.io is
+# claimed by an unrelated AWS TUI). The user-facing binary keeps its short
+# name — `brew install …/claws-tui` then `claws` to run it.
 [[bin]]
 name = "claws"
 path = "src/main.rs"

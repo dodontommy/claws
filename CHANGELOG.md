@@ -4,6 +4,19 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.4.0] — unreleased
+
+### Renamed
+- **The crate is now `claws-tui`.** The unsuffixed `claws` name on
+  crates.io and the `dodontommy/tap/claws` Homebrew formula collided
+  with an unrelated AWS TUI of the same name (clawscli/claws). The
+  brand and the binary stay `claws` — only the package name moves.
+  Install path is now `brew install dodontommy/tap/claws-tui` and
+  `https://github.com/dodontommy/claws-tui/releases/...`. The binary
+  invoked from your shell is unchanged: `claws`. The GitHub repo also
+  moves to `dodontommy/claws-tui` (with auto-redirect from the old URL,
+  so existing clones / installer URLs / blog posts keep working).
+
 ## [0.3.6] — 2026-05-04
 
 ### Fixed

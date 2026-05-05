@@ -17,22 +17,22 @@ claws owns each `claude` process inside its own PTY and gives you one dashboard 
 macOS:
 
 ```sh
-brew install dodontommy/tap/claws
+brew install dodontommy/tap/claws-tui
 ```
 
 Linux:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/claws/releases/latest/download/claws-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dodontommy/claws-tui/releases/latest/download/claws-tui-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -c "irm https://github.com/dodontommy/claws/releases/latest/download/claws-installer.ps1 | iex"
+powershell -c "irm https://github.com/dodontommy/claws-tui/releases/latest/download/claws-tui-installer.ps1 | iex"
 ```
 
-`claude` (the Claude Code CLI) needs to be on your `PATH` — claws spawns it. Run `claws` to open the dashboard, `claws update` to upgrade in place.
+The package is `claws-tui` (the unsuffixed `claws` slot on crates.io and Homebrew belongs to an unrelated AWS TUI), but the binary you run is just `claws`. `claude` (the Claude Code CLI) needs to be on your `PATH` — claws spawns it. Run `claws` to open the dashboard, `claws update` to upgrade in place.
 
 ## What you get
 
