@@ -4,6 +4,26 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.4.2] — unreleased
+
+### Fixed
+- **In-place upgrades on Linux no longer wedge `UserPromptSubmit`.**
+  When the on-disk claws binary gets replaced while the daemon is
+  running (typical for `claws update` or `cargo install`), Linux marks
+  `/proc/self/exe` with a literal ` (deleted)` suffix until the process
+  restarts. The daemon was passing that path through `current_exe()`
+  straight into per-session `settings.json`, baking commands like
+  `claws (deleted) hook-emit ...` into the hook config. Claude Code
+  shell-parses those, chokes on the unmatched `(`, and blocks every
+  prompt submit with `operation blocked by hook: UserPromptSubmit`.
+  Symptom appeared right after upgrading and persisted even on session
+  spawn until the daemon was killed *and* its socket file removed.
+
+  Now the suffix is stripped before the path goes into settings.json.
+  Existing tainted sessions get healed automatically — write_settings_for
+  runs on every spawn / resume / restart, so any session you re-enter
+  after upgrading to 0.4.2 will rewrite a clean settings.json.
+
 ## [0.4.1] — unreleased
 
 ### Added

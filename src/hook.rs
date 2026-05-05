@@ -43,13 +43,29 @@ pub fn build_settings_json(claws_exe: &Path, session_id: Uuid) -> Value {
     json!({ "hooks": hooks })
 }
 
+/// Resolve the running executable's path, stripping the ` (deleted)`
+/// suffix Linux appends to `/proc/self/exe` when the binary file has
+/// been unlinked (typically because an in-place upgrade replaced it
+/// while the daemon was running). Without this, `build_settings_json`
+/// bakes a literal `claws (deleted) hook-emit ...` command into every
+/// per-session settings.json — Claude shell-parses that, hits the
+/// unmatched `(`, and blocks UserPromptSubmit with a hook-syntax error.
+fn strip_deleted_suffix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s).to_string())
+}
+
+fn current_exe_clean() -> Result<PathBuf> {
+    Ok(strip_deleted_suffix(&std::env::current_exe()?))
+}
+
 pub fn write_settings_for(session_id: Uuid) -> Result<PathBuf> {
     let dir = paths::state_dir()?
         .join("sessions")
         .join(session_id.to_string());
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("settings.json");
-    let exe = std::env::current_exe()?;
+    let exe = current_exe_clean()?;
     let settings = build_settings_json(&exe, session_id);
     std::fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
     Ok(path)
@@ -98,6 +114,30 @@ mod tests {
         let serialized = serde_json::to_string(&v).unwrap();
         assert!(serialized.contains(&id.to_string()), "session id not in output");
         assert!(serialized.contains("hook-emit"), "hook-emit not in output");
+    }
+
+    #[test]
+    fn strip_deleted_suffix_removes_linux_proc_marker() {
+        // Linux's /proc/self/exe appends " (deleted)" once the on-disk
+        // binary has been unlinked (e.g., after an in-place upgrade).
+        // The hook command goes into a shell-parsed string, so the
+        // unmatched `(` would otherwise corrupt the command.
+        let p = PathBuf::from("/home/u/.cargo/bin/claws (deleted)");
+        assert_eq!(strip_deleted_suffix(&p), PathBuf::from("/home/u/.cargo/bin/claws"));
+    }
+
+    #[test]
+    fn strip_deleted_suffix_passes_through_clean_paths() {
+        let p = PathBuf::from("/usr/local/bin/claws");
+        assert_eq!(strip_deleted_suffix(&p), p);
+    }
+
+    #[test]
+    fn strip_deleted_suffix_doesnt_match_substring() {
+        // Only strip the trailing literal " (deleted)" — a path that
+        // happens to contain that text mid-string stays intact.
+        let p = PathBuf::from("/opt/weird (deleted) path/claws");
+        assert_eq!(strip_deleted_suffix(&p), p);
     }
 
     #[test]
