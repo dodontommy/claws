@@ -16,6 +16,12 @@ pub fn log_file() -> Result<PathBuf> {
     Ok(state_dir()?.join("claws.log"))
 }
 
+pub fn config_file() -> Result<PathBuf> {
+    let p = dirs()?.config_dir().to_path_buf();
+    std::fs::create_dir_all(&p).ok();
+    Ok(p.join("config.toml"))
+}
+
 #[cfg(unix)]
 pub fn socket_name() -> Result<String> {
     use std::os::unix::ffi::OsStrExt;

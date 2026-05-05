@@ -1,6 +1,6 @@
 [package]
 name = "claws-tui"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "TUI multiplexer for Claude Code sessions"
 repository = "https://github.com/dodontommy/claws-tui"
@@ -39,6 +39,7 @@ vt100 = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "fs", "process"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }

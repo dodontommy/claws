@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 mod auth;
 mod client;
+mod config;
 mod daemon;
 mod git;
 mod hook;

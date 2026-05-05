@@ -4,6 +4,20 @@ All notable changes to claws are listed here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow
 [SemVer](https://semver.org/).
 
+## [0.4.1] — unreleased
+
+### Added
+- **Configurable prefix key.** The command prefix (default Ctrl-Space)
+  can now be remapped via a `config.toml` in the platform's standard
+  config directory (`~/.config/claws/` on Linux, `~/Library/Application
+  Support/claws/` on macOS, `%APPDATA%\claws\` on Windows — same root
+  as the daemon state dir). Set `[keys] prefix = "ctrl-a"` to avoid
+  conflicts with tmux or other tools that claim Ctrl-Space. The
+  format accepts `ctrl-<key>`, `alt-<key>`, and `ctrl-alt-<key>`
+  combinations (case-insensitive); `<key>` is a single character or
+  the literal `space`. Help overlay and footer bar reflect the
+  configured binding dynamically.
+
 ## [0.4.0] — unreleased
 
 ### Renamed
