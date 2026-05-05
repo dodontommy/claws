@@ -589,9 +589,12 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
                 return;
             }
             (KeyCode::Enter, _) => {
-                // [+ new worktree] is a special row that opens the sub-modal
-                // and never falls through to spawn.
-                if *focus == FormField::Worktrees && *wt_selected == 0 {
+                // Worktree list is rendered with real worktrees at indices
+                // 0..worktrees.len() and `[+ new worktree]` as the last row
+                // at index worktrees.len(). The `[+ new]` row opens the
+                // sub-modal and never falls through to spawn; an existing
+                // worktree row populates cwd and falls through.
+                if *focus == FormField::Worktrees && *wt_selected == worktrees.len() {
                     if let Some(root) = repo_root.clone() {
                         let suggested_branch = crate::git::suggest_branch_name(
                             root.file_name()
@@ -617,11 +620,8 @@ async fn handle_spawn_form_key(key: KeyEvent, app: &mut App) {
                     }
                 }
 
-                // Enter on an existing worktree row: populate cwd from that
-                // worktree, then fall through to the normal submit. Single
-                // press → spawn — no second Enter required.
                 if *focus == FormField::Worktrees {
-                    if let Some(wt) = worktrees.get(*wt_selected - 1) {
+                    if let Some(wt) = worktrees.get(*wt_selected) {
                         *cwd = wt.path.to_string_lossy().into_owned();
                         *cwd_cursor = cwd.len();
                     }
@@ -1807,60 +1807,45 @@ fn draw_spawn_form(
     let parent = f.area();
     let w = 84.min(parent.width.saturating_sub(4));
 
-    // Cap visible rows per section.
     let recents_shown: u16 = recent.len().min(3) as u16;
     let wt_count_shown: u16 = worktrees.len().min(5) as u16;
     let has_repo = repo_root.is_some();
     let has_recents = recents_shown > 0;
 
-    // Pre-compute the row plan as a list of "row kinds" + heights so the
-    // padding logic is uniform: every section is preceded by a single
-    // blank row (except the first), and every section is `(label, body)`
-    // with no internal gaps.
+    // Layout plan. Compared to the pre-0.4 form: the "directory" and
+    // "recent" labels are gone (the `›` marker on the active row + the
+    // suggestions below it carry the structure). The collision warning
+    // is now an inline trailing badge on the input row instead of a
+    // separate banner. Worktrees keep a header but `[+ new worktree]`
+    // moves to the bottom of the list. Model and flags each lose their
+    // standalone label row and render label+value on a single line.
     enum RowKind {
         Pad,
-        DirLabel,
         DirInput,
-        RecentLabel,
         RecentList,
-        CollisionBanner,
         WtLabel,
-        WtList,
-        ModelLabel,
-        ModelPills,
-        FlagsLabel,
-        FlagsInput,
+        WtList, // worktrees first, then [+ new] at the end
+        ModelRow,
+        FlagsRow,
         SkipHint,
-        Examples,
         FooterHelp,
     }
 
     let mut plan: Vec<(RowKind, u16)> = Vec::new();
     plan.push((RowKind::Pad, 1));
-    plan.push((RowKind::DirLabel, 1));
     plan.push((RowKind::DirInput, 1));
     if has_recents {
-        plan.push((RowKind::Pad, 1));
-        plan.push((RowKind::RecentLabel, 1));
         plan.push((RowKind::RecentList, recents_shown));
-    }
-    if collision {
-        plan.push((RowKind::Pad, 1));
-        plan.push((RowKind::CollisionBanner, 1));
     }
     if has_repo {
         plan.push((RowKind::Pad, 1));
         plan.push((RowKind::WtLabel, 1));
-        plan.push((RowKind::WtList, 1 + wt_count_shown));
+        plan.push((RowKind::WtList, wt_count_shown + 1));
     }
     plan.push((RowKind::Pad, 1));
-    plan.push((RowKind::ModelLabel, 1));
-    plan.push((RowKind::ModelPills, 1));
-    plan.push((RowKind::Pad, 1));
-    plan.push((RowKind::FlagsLabel, 1));
-    plan.push((RowKind::FlagsInput, 1));
+    plan.push((RowKind::ModelRow, 1));
+    plan.push((RowKind::FlagsRow, 1));
     plan.push((RowKind::SkipHint, 1));
-    plan.push((RowKind::Examples, 1));
     plan.push((RowKind::Pad, 1));
     plan.push((RowKind::FooterHelp, 1));
     plan.push((RowKind::Pad, 1));
@@ -1881,49 +1866,51 @@ fn draw_spawn_form(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // 3-col left padding (1 from inner + 2 of breathing).
+    // 3-col left padding (1 from inner + 2 of breathing). All rows share
+    // the same content origin; the `›` marker (or two-space gutter) lives
+    // inside the content area.
     let content_x = inner.x + 3;
-    let content_w = inner.width.saturating_sub(6); // 3 each side
+    let content_w = inner.width.saturating_sub(6);
 
     let constraints: Vec<Constraint> =
         plan.iter().map(|(_, h)| Constraint::Length(*h)).collect();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(Rect::new(
-            content_x,
-            inner.y,
-            content_w,
-            inner.height,
-        ));
+        .split(Rect::new(content_x, inner.y, content_w, inner.height));
 
-    let label_dim = Style::default().fg(theme.dim);
-    let label_active = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+    let active = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
 
-    // Track input row indices for cursor placement.
+    // Helper: 2-char marker (`›` when active, two spaces otherwise).
+    let marker = |is_active: bool| -> (Span<'static>, usize) {
+        if is_active {
+            (Span::styled("› ", active), 2)
+        } else {
+            (Span::styled("  ", dim), 2)
+        }
+    };
+
+    // Track row indices for terminal cursor placement after the render
+    // pass (Paragraph doesn't expose a cursor; we set it on the Frame).
     let mut idx_dir_input: Option<usize> = None;
+    let mut dir_marker_w: usize = 2;
     let mut idx_flags_input: Option<usize> = None;
+    let mut flags_label_w: usize = 0;
 
     for (i, (kind, _)) in plan.iter().enumerate() {
         let area = chunks[i];
         match kind {
             RowKind::Pad => {}
-            RowKind::DirLabel => {
-                f.render_widget(
-                    Paragraph::new("directory").style(if focus == FormField::Cwd {
-                        label_active
-                    } else {
-                        label_dim
-                    }),
-                    area,
-                );
-            }
+
             RowKind::DirInput => {
                 idx_dir_input = Some(i);
-                let mut spans: Vec<Span<'static>> = vec![Span::styled(
-                    cwd.to_string(),
-                    Style::default().fg(theme.title),
-                )];
+                let (m, mw) = marker(focus == FormField::Cwd);
+                dir_marker_w = mw;
+                let mut spans: Vec<Span<'static>> = vec![
+                    m,
+                    Span::styled(cwd.to_string(), Style::default().fg(theme.title)),
+                ];
                 if focus == FormField::Cwd {
                     if let Some(suffix) = cwd_completion {
                         if !suffix.is_empty() {
@@ -1934,9 +1921,6 @@ fn draw_spawn_form(
                         }
                     }
                 }
-                // Missing-directory hint: only when no completion is offered
-                // (the two would visually conflict). The hint colour matches
-                // the "needs you" warn palette so it reads as actionable.
                 if cwd_missing && cwd_completion.map(|s| s.is_empty()).unwrap_or(true) {
                     spans.push(Span::styled(
                         "  [enter to mkdir -p]".to_string(),
@@ -1945,42 +1929,54 @@ fn draw_spawn_form(
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
+                if collision {
+                    // Right-aligned trailing `⚠ in use` badge, replacing the
+                    // dedicated banner row. Width-aware so it doesn't clip
+                    // the typed path on narrow terminals — drops out below
+                    // ~50 cols when there's no room.
+                    let used: usize = spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum();
+                    let badge = "⚠ in use";
+                    let badge_w = badge.chars().count();
+                    let avail = (area.width as usize).saturating_sub(used);
+                    if avail >= badge_w + 2 {
+                        let pad = " ".repeat(avail - badge_w);
+                        spans.push(Span::styled(pad, dim));
+                        spans.push(Span::styled(
+                            badge.to_string(),
+                            Style::default()
+                                .fg(theme.context_high)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
                 f.render_widget(Paragraph::new(Line::from(spans)), area);
             }
-            RowKind::RecentLabel => {
-                f.render_widget(
-                    Paragraph::new("recent").style(label_dim),
-                    area,
-                );
-            }
+
             RowKind::RecentList => {
                 let inner_w = area.width as usize;
                 for (j, dir) in recent.iter().take(recents_shown as usize).enumerate() {
                     let y = area.y + j as u16;
-                    let active = j == recent_selected && focus == FormField::Cwd;
-                    let marker = if active { "› " } else { "  " };
-                    let marker_style = if active {
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.dim)
-                    };
+                    let row_active = j == recent_selected && focus == FormField::Cwd;
+                    let (m, _) = marker(row_active);
                     let basename = cwd_basename(dir);
                     let display_path = shorten_home(dir);
                     let bn = format!("{:<16}", truncate_ellipsis(&basename, 16));
                     let bn_w = bn.chars().count();
                     let path_avail = inner_w.saturating_sub(bn_w + 2 + 2);
                     let path_short = truncate_ellipsis(&display_path, path_avail);
-                    let name_style = if active {
+                    let name_style = if row_active {
                         Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(theme.body)
                     };
-                    let path_style = Style::default().fg(theme.dim);
                     let line = Line::from(vec![
-                        Span::styled(marker.to_string(), marker_style),
+                        m,
                         Span::styled(bn, name_style),
-                        Span::styled("  ", path_style),
-                        Span::styled(path_short, path_style),
+                        Span::styled("  ", dim),
+                        Span::styled(path_short, dim),
                     ]);
                     f.render_widget(
                         Paragraph::new(line),
@@ -1988,58 +1984,28 @@ fn draw_spawn_form(
                     );
                 }
             }
-            RowKind::CollisionBanner => {
-                f.render_widget(
-                    Paragraph::new("⚠  session already running in this directory")
-                        .style(Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)),
-                    area,
-                );
-            }
+
             RowKind::WtLabel => {
                 let repo_label = repo_root
                     .and_then(|r| r.file_name())
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
-                let style = if focus == FormField::Worktrees { label_active } else { label_dim };
+                let style = if focus == FormField::Worktrees { active } else { dim };
                 f.render_widget(
-                    Paragraph::new(format!("worktrees · {repo_label}")).style(style),
+                    Paragraph::new(format!("  {repo_label} · worktrees")).style(style),
                     area,
                 );
             }
-            RowKind::WtList => {
-                // Row 0: [+ new worktree]
-                let new_active = wt_selected == 0 && focus == FormField::Worktrees;
-                let new_marker = if new_active { "› " } else { "  " };
-                let marker_style = if new_active {
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.dim)
-                };
-                let new_label_style = if new_active {
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.accent)
-                };
-                let new_line = Line::from(vec![
-                    Span::styled(new_marker.to_string(), marker_style),
-                    Span::styled("[+ new worktree]", new_label_style),
-                ]);
-                f.render_widget(
-                    Paragraph::new(new_line),
-                    Rect::new(area.x, area.y, area.width, 1),
-                );
 
+            RowKind::WtList => {
                 let inner_w = area.width as usize;
+                // Real worktrees first, capped at wt_count_shown for layout
+                // height. wt_selected indices match this ordering.
                 for (j, wt) in worktrees.iter().take(wt_count_shown as usize).enumerate() {
-                    let y = area.y + 1 + j as u16;
-                    let active = focus == FormField::Worktrees && wt_selected == j + 1;
+                    let y = area.y + j as u16;
+                    let row_active = focus == FormField::Worktrees && wt_selected == j;
+                    let (m, _) = marker(row_active);
                     let is_current = paths_equal(&wt.path.to_string_lossy(), cwd);
-                    let marker = if active { "› " } else { "  " };
-                    let marker_style = if active {
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.dim)
-                    };
                     let branch = wt.branch.clone().unwrap_or_else(|| "(detached)".into());
                     let branch_padded = format!("{:<16}", truncate_ellipsis(&branch, 16));
                     let path_str = wt.path.to_string_lossy().into_owned();
@@ -2049,18 +2015,17 @@ fn draw_spawn_form(
                     let suffix_w = suffix.chars().count();
                     let path_avail = inner_w.saturating_sub(bn_w + 2 + suffix_w + 2);
                     let path_short = truncate_ellipsis(&path_disp, path_avail);
-                    let branch_style = if active {
+                    let branch_style = if row_active {
                         Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(theme.model)
                     };
-                    let path_style = Style::default().fg(theme.dim);
                     let suffix_style = Style::default().fg(theme.idle).add_modifier(Modifier::ITALIC);
                     let line = Line::from(vec![
-                        Span::styled(marker.to_string(), marker_style),
+                        m,
                         Span::styled(branch_padded, branch_style),
-                        Span::styled("  ", path_style),
-                        Span::styled(path_short, path_style),
+                        Span::styled("  ", dim),
+                        Span::styled(path_short, dim),
                         Span::styled(suffix.to_string(), suffix_style),
                     ]);
                     f.render_widget(
@@ -2068,24 +2033,35 @@ fn draw_spawn_form(
                         Rect::new(area.x, y, area.width, 1),
                     );
                 }
-            }
-            RowKind::ModelLabel => {
+                // [+ new worktree] anchored to the last row.
+                let new_idx = worktrees.len();
+                let new_y = area.y + wt_count_shown;
+                let new_active = wt_selected == new_idx && focus == FormField::Worktrees;
+                let (m, _) = marker(new_active);
+                let label_style = if new_active {
+                    active
+                } else {
+                    Style::default().fg(theme.accent)
+                };
+                let new_line = Line::from(vec![
+                    m,
+                    Span::styled("[+ new worktree]", label_style),
+                ]);
                 f.render_widget(
-                    Paragraph::new("model").style(if focus == FormField::Model {
-                        label_active
-                    } else {
-                        label_dim
-                    }),
-                    area,
+                    Paragraph::new(new_line),
+                    Rect::new(area.x, new_y, area.width, 1),
                 );
             }
-            RowKind::ModelPills => {
+
+            RowKind::ModelRow => {
+                let label_w: usize = 8;
+                let label = format!("{:<width$}", "model", width = label_w);
+                let label_style = if focus == FormField::Model { active } else { dim };
+                let mut spans: Vec<Span<'static>> = vec![Span::styled(label, label_style)];
                 let active_field = focus == FormField::Model;
-                let mut spans: Vec<Span<'static>> = Vec::new();
                 for (idx, m) in ModelChoice::ALL.iter().enumerate() {
                     let selected = *m == model;
-                    let pill = format!(" {} ", m.label());
-                    let style = match (selected, active_field) {
+                    let pill_style = match (selected, active_field) {
                         (true, true) => Style::default()
                             .fg(theme.body)
                             .bg(theme.accent)
@@ -2093,38 +2069,26 @@ fn draw_spawn_form(
                         (true, false) => Style::default()
                             .fg(theme.title)
                             .add_modifier(Modifier::BOLD),
-                        (false, _) => Style::default().fg(theme.dim),
+                        (false, _) => dim,
                     };
-                    spans.push(Span::styled(pill, style));
+                    spans.push(Span::styled(format!(" {} ", m.label()), pill_style));
                     if idx + 1 < ModelChoice::ALL.len() {
-                        spans.push(Span::styled("  ", Style::default().fg(theme.dim)));
+                        spans.push(Span::styled(" · ", dim));
                     }
                 }
                 if active_field {
-                    spans.push(Span::styled("    ", Style::default().fg(theme.dim)));
-                    spans.push(Span::styled(
-                        "← →",
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-                    ));
-                    spans.push(Span::styled(
-                        " cycle",
-                        Style::default().fg(theme.dim),
-                    ));
+                    spans.push(Span::styled("    ".to_string(), dim));
+                    spans.push(Span::styled("← →", active));
                 }
                 f.render_widget(Paragraph::new(Line::from(spans)), area);
             }
-            RowKind::FlagsLabel => {
-                f.render_widget(
-                    Paragraph::new("flags").style(if focus == FormField::Args {
-                        label_active
-                    } else {
-                        label_dim
-                    }),
-                    area,
-                );
-            }
-            RowKind::FlagsInput => {
+
+            RowKind::FlagsRow => {
                 idx_flags_input = Some(i);
+                let label_w: usize = 8;
+                flags_label_w = label_w;
+                let label = format!("{:<width$}", "flags", width = label_w);
+                let label_style = if focus == FormField::Args { active } else { dim };
                 let display = if args.is_empty() {
                     if focus == FormField::Args {
                         String::new()
@@ -2134,41 +2098,41 @@ fn draw_spawn_form(
                 } else {
                     args.to_string()
                 };
-                let style = if args.is_empty() && focus != FormField::Args {
+                let value_style = if args.is_empty() && focus != FormField::Args {
                     Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)
                 } else {
                     Style::default().fg(theme.title)
                 };
-                f.render_widget(Paragraph::new(display).style(style), area);
+                let line = Line::from(vec![
+                    Span::styled(label, label_style),
+                    Span::styled(display, value_style),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
             }
+
             RowKind::SkipHint => {
                 let skip_flag = "--dangerously-skip-permissions";
                 let skip_on = args.split_whitespace().any(|t| t == skip_flag);
                 let state_style = if skip_on {
                     Style::default().fg(theme.context_high).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme.dim)
+                    dim
                 };
+                // Indented under the flags input by the same label width
+                // so the toggle visually attaches to the field it edits.
+                let pad = " ".repeat(flags_label_w);
                 let line = Line::from(vec![
-                    Span::styled(
-                        "ctrl-y ",
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("skip permissions: ", Style::default().fg(theme.dim)),
+                    Span::styled(pad, dim),
+                    Span::styled("ctrl-y ", active),
+                    Span::styled("skip permissions: ", dim),
                     Span::styled(if skip_on { "on" } else { "off" }, state_style),
                 ]);
                 f.render_widget(Paragraph::new(line), area);
             }
-            RowKind::Examples => {
-                f.render_widget(
-                    Paragraph::new("examples: --effort xhigh · -p \"…\" · --add-dir <path>")
-                        .style(Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC)),
-                    area,
-                );
-            }
+
             RowKind::FooterHelp => {
-                let key = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
-                let desc = Style::default().fg(theme.dim);
+                let key = active;
+                let desc = dim;
                 let pair = |k: &'static str, v: &'static str| -> [Span<'static>; 3] {
                     [
                         Span::styled(k.to_string(), key),
@@ -2176,13 +2140,13 @@ fn draw_spawn_form(
                         Span::styled(v.to_string(), desc),
                     ]
                 };
-                let gap = || Span::styled("    ", desc);
+                let gap = || Span::styled("   ", desc);
                 let mut spans: Vec<Span<'static>> = Vec::new();
-                spans.extend(pair("enter", "create"));
+                spans.extend(pair("enter", "spawn"));
                 spans.push(gap());
-                spans.extend(pair("tab", "next field"));
+                spans.extend(pair("tab", "next"));
                 spans.push(gap());
-                spans.extend(pair("↑↓", "navigate"));
+                spans.extend(pair("↑↓", "pick"));
                 spans.push(gap());
                 spans.extend(pair("esc", "cancel"));
                 f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -2190,15 +2154,20 @@ fn draw_spawn_form(
         }
     }
 
-    // Cursor placement (after rendering).
     match (focus, idx_dir_input, idx_flags_input) {
         (FormField::Cwd, Some(i), _) => {
             let row = chunks[i];
-            f.set_cursor_position(Position::new(row.x + cwd_cursor as u16, row.y));
+            f.set_cursor_position(Position::new(
+                row.x + dir_marker_w as u16 + cwd_cursor as u16,
+                row.y,
+            ));
         }
         (FormField::Args, _, Some(i)) => {
             let row = chunks[i];
-            f.set_cursor_position(Position::new(row.x + args_cursor as u16, row.y));
+            f.set_cursor_position(Position::new(
+                row.x + flags_label_w as u16 + args_cursor as u16,
+                row.y,
+            ));
         }
         _ => {}
     }
