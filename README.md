@@ -94,7 +94,16 @@ After a reboot the daemon is gone but the JSONL transcripts Claude writes aren't
 
 ## Configuration
 
-Pretty much none, by design. Default colors, keymap baked in, sensible behavior on a fresh install. Theme is the one persistent setting — picked once, remembered.
+Minimal, by design. Default colors, sensible defaults on a fresh install. Theme is picked once and remembered.
+
+One optional config file lives in the platform's standard config dir — `~/.config/claws/config.toml` on Linux, `~/Library/Application Support/claws/config.toml` on macOS, `%APPDATA%\claws\config.toml` on Windows. Currently it accepts one setting, the command prefix:
+
+```toml
+[keys]
+prefix = "ctrl-a"   # default is "ctrl-space"; also supports alt-<x> and ctrl-alt-<x>
+```
+
+Useful if you run claws inside tmux and have already claimed `Ctrl-Space` for your tmux prefix. Anything missing or invalid falls back to the default.
 
 Per-session settings (cwd, flags, name, model) survive across resumes via a small SQLite file in your local data directory. You don't manage it; it manages itself.
 
