@@ -194,10 +194,11 @@ struct App {
     /// a session can change, but we re-derive on F5 / daemon restart and
     /// most worktrees stay on one branch for the duration of a session.
     session_branches: std::collections::HashMap<Uuid, Option<String>>,
+    prefix: crate::config::PrefixKey,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(config: crate::config::Config) -> Self {
         let pwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -221,6 +222,7 @@ impl App {
             detail_scroll: 0,
             last_status: std::collections::HashMap::new(),
             session_branches: std::collections::HashMap::new(),
+            prefix: config.prefix,
         }
     }
 
@@ -311,7 +313,8 @@ impl App {
 }
 
 async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let mut app = App::new();
+    let config = crate::config::load();
+    let mut app = App::new(config);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
@@ -1159,9 +1162,7 @@ async fn handle_attached_key(key: KeyEvent, app: &mut App) {
         _ => return,
     };
 
-    // Ctrl-Space toggles prefix mode, unless we're already in prefix mode.
-    let is_prefix_keystroke =
-        key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL);
+    let is_prefix_keystroke = app.prefix.matches(key.code, key.modifiers);
 
     if !prefix_active && is_prefix_keystroke {
         *take_prefix = true;
@@ -1200,9 +1201,11 @@ async fn handle_attached_key(key: KeyEvent, app: &mut App) {
             (KeyCode::Char('?'), _) => {
                 app.set_status("prefix: d=detach n/p=cycle 1-9=jump [=scroll q=quit".into());
             }
-            (KeyCode::Char(' '), m) if m.contains(KeyModifiers::CONTROL) => {
-                // Literal Ctrl-Space passthrough
-                let _ = client::send_input_raw(session_id, b"\x00".to_vec()).await;
+            (code, mods) if app.prefix.matches(code, mods) => {
+                let bytes = encode_key(&key);
+                if !bytes.is_empty() {
+                    let _ = client::send_input_raw(session_id, bytes).await;
+                }
             }
             _ => {}
         }
@@ -1403,7 +1406,7 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
             *focus,
             error.as_deref(),
         ),
-        Modal::Help { scroll } => draw_help(f, *scroll),
+        Modal::Help { scroll } => draw_help(f, *scroll, &app.prefix.label()),
         Modal::Rename { input, cursor, session_id } => {
             let placeholder = app
                 .sessions
@@ -1426,7 +1429,7 @@ fn draw_modal(f: &mut ratatui::Frame, modal: &Modal, app: &App) {
                     .and_then(|b| b.clone());
                 draw_details(f, s, branch.as_deref());
             } else {
-                draw_help(f, 0);
+                draw_help(f, 0, &app.prefix.label());
             }
         }
         Modal::ThemePicker { selected_idx, .. } => draw_theme_picker(f, *selected_idx),
@@ -1498,7 +1501,7 @@ fn draw_theme_picker(f: &mut ratatui::Frame, selected_idx: usize) {
     );
 }
 
-fn draw_help(f: &mut ratatui::Frame, scroll: u16) {
+fn draw_help(f: &mut ratatui::Frame, scroll: u16, prefix_label: &str) {
     let theme = crate::theme::current();
     let parent = f.area();
     let w = 78.min(parent.width.saturating_sub(4));
@@ -1526,7 +1529,7 @@ fn draw_help(f: &mut ratatui::Frame, scroll: u16) {
     let dim_style = Style::default().fg(theme.dim);
 
     // Section header: ▎ in theme.accent + bold label.
-    let sec = |label: &'static str| -> Line<'static> {
+    let sec = |label: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled(
                 "▎ ",
@@ -1572,16 +1575,16 @@ fn draw_help(f: &mut ratatui::Frame, scroll: u16) {
 
     lines.push(Line::from(""));
     lines.push(sec("attached view"));
-    lines.push(row("Ctrl-Space", "prefix — next key is a claws command"));
-    lines.push(row("Ctrl-Space d", "detach back to dashboard"));
-    lines.push(row("Ctrl-Space n / p", "next / previous session"));
-    lines.push(row("Ctrl-Space 1-9", "jump to session N"));
-    lines.push(row("Ctrl-Space [", "enter scroll mode  (read history)"));
-    lines.push(row("Ctrl-Space q", "quit TUI"));
-    lines.push(row("Ctrl-Space Ctrl-Space", "send literal Ctrl-Space to claude"));
+    lines.push(row(prefix_label, "prefix — next key is a claws command"));
+    lines.push(row(&format!("{prefix_label} d"), "detach back to dashboard"));
+    lines.push(row(&format!("{prefix_label} n / p"), "next / previous session"));
+    lines.push(row(&format!("{prefix_label} 1-9"), "jump to session N"));
+    lines.push(row(&format!("{prefix_label} ["), "enter scroll mode  (read history)"));
+    lines.push(row(&format!("{prefix_label} q"), "quit TUI"));
+    lines.push(row(&format!("{prefix_label} {prefix_label}"), &format!("send literal {prefix_label} to claude")));
 
     lines.push(Line::from(""));
-    lines.push(sec("scroll mode  (Ctrl-Space [)"));
+    lines.push(sec(&format!("scroll mode  ({prefix_label} [)")));
     lines.push(row("↑ / ↓  or  j / k", "scroll one screenful"));
     lines.push(row("PageUp / PageDown", "scroll several screenfuls"));
     lines.push(row("g / Home", "jump to start of history"));
@@ -3575,7 +3578,8 @@ fn draw_attached(f: &mut ratatui::Frame, app: &App) {
     } else if prefix_active {
         " ◆ prefix:  d  detach   n/p  next/prev   1-9  jump   [  scroll   q  quit".to_string()
     } else {
-        " Ctrl-Space  prefix (d=detach n/p=cycle 1-9=jump [=scroll)    keys → claude".to_string()
+        let pl = app.prefix.label();
+        format!(" {pl}  prefix (d=detach n/p=cycle 1-9=jump [=scroll)    keys → claude")
     };
     let footer_color = if scroll.is_some() {
         theme.footer_scroll
