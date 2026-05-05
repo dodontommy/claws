@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyModifiers};
-use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct PrefixKey {
@@ -9,7 +8,9 @@ pub struct PrefixKey {
 
 impl PrefixKey {
     pub fn matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        code == self.code && modifiers.contains(self.modifiers)
+        // Match exact modifier set so that, e.g., a `ctrl-alt-x` config
+        // doesn't accidentally fire on a plain `ctrl-x` keystroke.
+        code == self.code && modifiers == self.modifiers
     }
 
     pub fn label(&self) -> String {
@@ -18,11 +19,14 @@ impl PrefixKey {
             KeyCode::Char(c) => c.to_string(),
             _ => "?".to_string(),
         };
+        let mut prefix = String::new();
         if self.modifiers.contains(KeyModifiers::CONTROL) {
-            format!("Ctrl-{key_part}")
-        } else {
-            key_part
+            prefix.push_str("Ctrl-");
         }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            prefix.push_str("Alt-");
+        }
+        format!("{prefix}{key_part}")
     }
 }
 
@@ -48,49 +52,58 @@ impl Default for Config {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .filter(|p| p.is_absolute())
-        .or_else(|| dirs_home().map(|h| h.join(".config")))?;
-    Some(base.join("claws").join("config.toml"))
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        std::env::var("HOME").ok().map(PathBuf::from)
-    }
-    #[cfg(windows)]
-    {
-        std::env::var("USERPROFILE").ok().map(PathBuf::from)
-    }
-}
-
+/// Parse a prefix-key string of the form `<mod>-...-<key>`, where each
+/// `<mod>` is one of `ctrl` or `alt` (each at most once, any order) and
+/// `<key>` is either a single char or the literal `space`. At least one
+/// modifier is required — bare keys like `space` or `a` would collide
+/// with normal typing in attached mode and aren't useful as a prefix.
 fn parse_prefix(s: &str) -> Option<PrefixKey> {
-    let s = s.trim().to_lowercase();
-    let parts: Vec<&str> = s.split('-').collect();
-
-    if parts.len() == 2 && parts[0] == "ctrl" {
-        let code = match parts[1] {
-            "space" => KeyCode::Char(' '),
-            c if c.len() == 1 => KeyCode::Char(c.chars().next().unwrap()),
-            _ => return None,
-        };
-        Some(PrefixKey {
-            code,
-            modifiers: KeyModifiers::CONTROL,
-        })
-    } else {
-        None
+    let lower = s.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
     }
+    let parts: Vec<&str> = lower.split('-').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let (mods, key) = parts.split_at(parts.len() - 1);
+    let key = key[0];
+
+    let mut modifiers = KeyModifiers::NONE;
+    for m in mods {
+        match *m {
+            "ctrl" if !modifiers.contains(KeyModifiers::CONTROL) => {
+                modifiers |= KeyModifiers::CONTROL;
+            }
+            "alt" if !modifiers.contains(KeyModifiers::ALT) => {
+                modifiers |= KeyModifiers::ALT;
+            }
+            // Unknown modifier, duplicate modifier, or empty token (e.g.
+            // from `ctrl--a`).
+            _ => return None,
+        }
+    }
+    if modifiers.is_empty() {
+        return None;
+    }
+
+    let code = match key {
+        "space" => KeyCode::Char(' '),
+        c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap()),
+        _ => return None,
+    };
+
+    Some(PrefixKey { code, modifiers })
 }
 
 pub fn load() -> Config {
-    let path = match config_path() {
-        Some(p) => p,
-        None => return Config::default(),
+    let path = match crate::paths::config_file() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not resolve config dir; using defaults");
+            return Config::default();
+        }
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -132,7 +145,7 @@ mod tests {
     fn parse_ctrl_space() {
         let pk = parse_prefix("ctrl-space").unwrap();
         assert_eq!(pk.code, KeyCode::Char(' '));
-        assert!(pk.modifiers.contains(KeyModifiers::CONTROL));
+        assert_eq!(pk.modifiers, KeyModifiers::CONTROL);
         assert_eq!(pk.label(), "Ctrl-Space");
     }
 
@@ -140,7 +153,7 @@ mod tests {
     fn parse_ctrl_a() {
         let pk = parse_prefix("ctrl-a").unwrap();
         assert_eq!(pk.code, KeyCode::Char('a'));
-        assert!(pk.modifiers.contains(KeyModifiers::CONTROL));
+        assert_eq!(pk.modifiers, KeyModifiers::CONTROL);
         assert_eq!(pk.label(), "Ctrl-a");
     }
 
@@ -148,7 +161,7 @@ mod tests {
     fn parse_ctrl_backslash() {
         let pk = parse_prefix("ctrl-\\").unwrap();
         assert_eq!(pk.code, KeyCode::Char('\\'));
-        assert!(pk.modifiers.contains(KeyModifiers::CONTROL));
+        assert_eq!(pk.modifiers, KeyModifiers::CONTROL);
     }
 
     #[test]
@@ -158,11 +171,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_alt_a() {
+        let pk = parse_prefix("alt-a").unwrap();
+        assert_eq!(pk.code, KeyCode::Char('a'));
+        assert_eq!(pk.modifiers, KeyModifiers::ALT);
+        assert_eq!(pk.label(), "Alt-a");
+    }
+
+    #[test]
+    fn parse_alt_space() {
+        let pk = parse_prefix("alt-space").unwrap();
+        assert_eq!(pk.code, KeyCode::Char(' '));
+        assert_eq!(pk.modifiers, KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn parse_ctrl_alt_x() {
+        let pk = parse_prefix("ctrl-alt-x").unwrap();
+        assert_eq!(pk.code, KeyCode::Char('x'));
+        assert_eq!(pk.modifiers, KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(pk.label(), "Ctrl-Alt-x");
+    }
+
+    #[test]
+    fn parse_alt_ctrl_x_order_independent() {
+        let pk = parse_prefix("alt-ctrl-x").unwrap();
+        assert_eq!(pk.modifiers, KeyModifiers::CONTROL | KeyModifiers::ALT);
+    }
+
+    #[test]
     fn parse_invalid_returns_none() {
-        assert!(parse_prefix("space").is_none());
-        assert!(parse_prefix("alt-a").is_none());
-        assert!(parse_prefix("ctrl-").is_none());
-        assert!(parse_prefix("ctrl-ab").is_none());
+        assert!(parse_prefix("space").is_none(), "bare key without modifier");
+        assert!(parse_prefix("a").is_none(), "bare char without modifier");
+        assert!(parse_prefix("shift-a").is_none(), "shift not supported");
+        assert!(parse_prefix("ctrl-").is_none(), "trailing dash");
+        assert!(parse_prefix("ctrl-ab").is_none(), "multi-char key");
+        assert!(parse_prefix("ctrl-ctrl-a").is_none(), "duplicate modifier");
+        assert!(parse_prefix("").is_none(), "empty");
+        assert!(parse_prefix("ctrl--a").is_none(), "empty modifier token");
     }
 
     #[test]
@@ -171,6 +217,19 @@ mod tests {
         assert!(pk.matches(KeyCode::Char(' '), KeyModifiers::CONTROL));
         assert!(!pk.matches(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(!pk.matches(KeyCode::Char(' '), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_alt_doesnt_match_ctrl_alone() {
+        // Modifier matching is exact: a `ctrl-alt-x` config must not fire
+        // on a plain `ctrl-x` keystroke (which would be ambiguous and
+        // surprising for a user who set the more specific binding).
+        let pk = parse_prefix("ctrl-alt-x").unwrap();
+        assert!(!pk.matches(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(pk.matches(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
     }
 
     #[test]
